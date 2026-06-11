@@ -1,85 +1,126 @@
-import sqlite3
-from string import Template
-from typing import Any
+"""
+Agent wiring.
 
-from langchain_core.callbacks import StreamingStdOutCallbackHandler
-from langchain_core.messages import SystemMessage
-from langchain.agents import create_agent
-from langchain.agents.middleware import dynamic_prompt
-from langchain_core.runnables import RunnableConfig
+This package exposes:
+  * `BaseAgent`         — abstract agent (prompt + tools + a model pool).
+  * `CodeReviewAgent`   — the concrete code-review implementation.
+  * `AGENTS`            — registry of ready-to-use agents, one per *role*.
+  * `ROLES`             — the role names (keys of AGENTS), for the UI to list.
+  * `graph_for(role, model)` — pick the compiled graph for a role + model.
+  * `review_session`    — interactive CLI entry point (used by main.py).
+
+Roles
+-----
+A *role* is one prompt "personality" (code-review, explore, ...). Every role is
+a `CodeReviewAgent` built from its own prompt template in `config.yaml` under
+`prompt:`, and each owns a full pool of model variants. Because the checkpointer
+keys only on `thread_id`, the caller can switch roles or models mid-session and
+keep the full conversation history — only the system prompt (and tools) change.
+
+The module-level `_cfg`, `_checkpointer`, `_agent_pool`, and `_agent` names are
+kept for backward compatibility with `ui/server.py`, which reaches into them
+directly. New code should prefer `graph_for(...)` / the `AGENTS` registry.
+"""
+import sqlite3
 from pathlib import Path
 
+import yaml
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from agents.llm_factory import make_llm
-from structured_output import ReviewState
-import yaml
+from agents.base import BaseAgent
+from agents.sub_agents.code_review.cr_act import CodeReviewAct
+from agents.sub_agents.code_review.cr_explore import CodeReviewExplore
+from agents.sub_agents.code_review.cr_plan import CodeReviewPlan
+from agents.sub_agents.code_review.cr_verify import CodeReviewVerify
+from agents.sub_agents.code_review_agent import CodeReviewAgent
+from agents.sub_agents.texting_agent import TextingAgent
 
-from tools.tools import run_linter, run_tests, analyze_architecture, run_type_check, read_file, list_all_files
+__all__ = [
+    "BaseAgent",
+    "CodeReviewAgent",
+    "AGENTS",
+    "ROLES",
+    "DEFAULT_ROLE",
+    "TOOLS_BY_ROLE",
+    "graph_for",
+    "review_agent",
+    "review_session",
+]
 
-# Load config
-with open("config.yaml" , "r", encoding="utf-8") as f:
+# ── config ──────────────────────────────────────────────────────────────────
+with open("config.yaml", "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 
-with open("tools.json", "r", encoding="utf-8") as f:
-    _tools = yaml.safe_load(f)
+# The role offered first / used as the fallback. Falls back to whatever prompt
+# is defined first if "code-review" is ever renamed away.
+DEFAULT_ROLE = "code-review" if "code-review" in _cfg["prompt"] else next(iter(_cfg["prompt"]))
 
-@dynamic_prompt
-def _language_prompt(request) -> str:
-    """System prompt rebuild per run, with project language and path filled in."""
-    language = request.state.get("language", "unknown")
-    project_path = request.state.get("project_path", ".")
-    return Template(_cfg["prompt"]["agent"]).safe_substitute(
-        language=language,
-        project_path=project_path,
-    )
-
-_tools_list = [run_linter, run_tests, analyze_architecture, run_type_check, read_file, list_all_files]
-
+# ── shared checkpointer ─────────────────────────────────────────────────────
 # Persistent SQLite checkpointer — survives server restarts so sessions can be
-# resumed. All agents in the pool share one instance; thread_id is the key.
+# resumed. Every role/model in every pool shares one instance; thread_id is the
+# key, which is what lets role/model switches keep the same conversation.
 _DB_PATH = Path(__file__).resolve().parent.parent / "ui" / "checkpoints.db"
 _conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
 _checkpointer = SqliteSaver(_conn)
 
-_agent_pool: dict[str, Any] = {
-    name: create_agent(
-        model=make_llm(cfg),
-        tools=_tools_list,
-        middleware=[_language_prompt],
-        state_schema=ReviewState,
-        checkpointer=_checkpointer,
-    )
-    for name, cfg in _cfg["agents"].items()
+# ── the agent registry (each entry owns its own pool of model variants) ─────
+# Every value here becomes a selectable role in the UI. Shared build options so
+# each agent gets the same model pool, checkpointer, and limits.
+_BUILD_OPTS = dict(
+    checkpointer=_checkpointer,
+    recursion_limit=_cfg.get("recursion_limit", 1000),
+    default_model="main_agent",
+)
+
+# Which class implements each role. Any prompt in config.yaml not listed here is
+# built with CodeReviewAgent (the default). A custom class that loads its
+# template from config only needs ONE line here — WIRE A NEW AGENT HERE.
+AGENT_CLASSES: dict[str, type[BaseAgent]] = {
+    "texting_agent": TextingAgent,
+    "cr_explore" : CodeReviewExplore,
+    "cr_plan": CodeReviewPlan,
+    "cr_act" : CodeReviewAct,
+    "cr_verify" : CodeReviewVerify,
+    # "code-review": CodeReviewAgent,   # default, no entry needed
+    # "explore":     CodeReviewAgent,   # default, no entry needed
 }
 
-_agent = _agent_pool["main_agent"]   # kept for backward compat with main.py
+# One agent per prompt in config.yaml, each built from its own template and its
+# mapped class. The role name is the single identity: it is the config `prompt:`
+# key, the AGENTS registry key (what the UI shows / routes by), and the agent's
+# `name` — all the same string.
+AGENTS: dict[str, BaseAgent] = {
+    role: AGENT_CLASSES.get(role, CodeReviewAgent)(
+        _cfg["agents"], template, name=role, **_BUILD_OPTS
+    )
+    for role, template in _cfg["prompt"].items()
+}
+
+ROLES = list(AGENTS)
+
+# Tools each role can run — the UI renders a checkbox per name and sends back
+# the enabled subset per turn (see BaseAgent's tool gate).
+TOOLS_BY_ROLE: dict[str, list[str]] = {role: agent.tool_names for role, agent in AGENTS.items()}
+
+# The default role's agent — convenient handle and backward-compat fallback.
+review_agent = AGENTS[DEFAULT_ROLE]
+
+
+def graph_for(role: str | None, model: str | None):
+    """Compiled graph for a (role, model) pair, falling back to sane defaults.
+
+    Unknown role -> default role's agent. Unknown model -> that agent's default
+    model. This is the single place the UI resolves a session to a runnable.
+    """
+    agent = AGENTS.get(role, review_agent)
+    return agent.get(model)
+
+
+# ── backward-compat aliases for ui/server.py (reaches into these directly) ──
+_agent_pool = review_agent.pool
+_agent = review_agent.default
+
 
 def review_session(project_path: str, language: str, thread_id: str = "review-1"):
-    config = {
-        "configurable": {"thread_id": thread_id},
-        "recursion_limit": _cfg.get("recursion_limit", 1000),
-        "callbacks":  [StreamingStdOutCallbackHandler()],
-    }
-
-    # First turn: full state, triggers the review.
-    result = _agent.invoke(
-        {
-            "messages": [{"role": "user", "content": "Review this project."}],
-            "project_path": project_path,
-            "language": language,
-        },
-        config=config,
-    )
-    print(result["messages"][-1].content)
-
-    # Follow-up loop: send ONLY the new question.
-    while True:
-        q = input("\nFollow-up (blank to quit): ").strip()
-        if not q:
-            break
-        result = _agent.invoke(
-            {"messages": [{"role": "user", "content": q}]},
-            config=config,  # same thread_id -> continues, keeps full history
-        )
-        print(result["messages"][-1].content)
+    """Interactive code-review CLI session (used by main.py)."""
+    return review_agent.run_session(project_path, language, thread_id=thread_id)

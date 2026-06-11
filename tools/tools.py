@@ -1,6 +1,8 @@
+import difflib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -10,6 +12,16 @@ from structured_output import ReviewState
 
 _IGNORE = {"__pycache__", "node_modules", ".git", ".venv", "venv",
            ".idea", ".mypy_cache", ".pytest_cache", "dist", "build"}
+
+# ── in-memory write snapshots (server-lifetime only) ─────────────────────
+# Before the agent modifies a file we stash its original content here so the
+# change can be reported (build_change_report) or undone (restore_snapshot).
+# Keyed by resolved project root -> {absolute_file_path: original_text | None}.
+# A value of None means "the file did not exist before the first write", so a
+# revert deletes it. This is deliberately NOT persisted to disk: snapshots live
+# only as long as the server process does.
+_SNAPSHOTS: dict[str, dict[str, "str | None"]] = {}
+_SNAPSHOT_LOCK = threading.RLock()
 
 # ── tools (used by ReAct agents) ────────────────────────────────────────
 @tool
@@ -42,9 +54,10 @@ def analyze_architecture(depth: int = 3, *,
 def read_file(file_path: str, *, state: Annotated[ReviewState, InjectedState]) -> str:
     """Read the complete text contents of a file inside the project."""
     print(f"Reading file: {file_path}")
-    p = Path(file_path)
-    if not p.is_absolute():
-        p = Path(state["project_path"]) / p
+    try:
+        p = _safe_path(file_path, state["project_path"])
+    except ValueError as e:
+        return f"Refused: {e}"
     return _read_file(str(p))
 
 @tool
@@ -52,6 +65,31 @@ def list_all_files(*, state: Annotated[ReviewState, InjectedState]) -> str:
     """List all files in the project under review."""
     print(f"Listing all files in {state['project_path']}")
     return _list_all_files(state["project_path"])
+
+@tool
+def write_file(file_path: str, content: str, *, state: Annotated[ReviewState, InjectedState]) -> str:
+    """Write content to a file inside the project."""
+    print(f"Writing file: {file_path}")
+    try:
+        p = _safe_path(file_path, state["project_path"])
+    except ValueError as e:
+        return f"Refused: {e}"
+    # Stash the pre-edit state before the first write so the change can be
+    # reported or reverted later (snapshots live for the server's lifetime).
+    _record_snapshot(state["project_path"], str(p))
+    return _write_file(str(p), content)
+
+@tool
+def build_change_report(file_paths: "list[str] | None" = None, *,
+                        state: Annotated[ReviewState, InjectedState]) -> str:
+    """Summarize what changed this session as unified diffs.
+
+    Compares each touched file against the snapshot taken before the agent first
+    edited it. With no argument, reports on EVERY file written so far this
+    session — a fast way to evaluate the changes without re-reading the tree.
+    """
+    print(f"Building change report for: {file_paths or 'all written files'}")
+    return _build_change_report(state["project_path"], file_paths)
 
 # ── tools implementations (used by tool calls) ───────────────────────────
 
@@ -216,3 +254,147 @@ def _venv_python(project_path: str) -> str:
                 if candidate.exists():
                     return str(candidate)
     return sys.executable
+
+def _write_file(file_path: str, content: str) -> str:
+    """Write text content to a file inside the sandbox."""
+    try:
+        p = Path(file_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return f"File {file_path} written successfully."
+    except Exception as e:
+        return f"Error writing file {file_path}: {e}"
+
+
+# ── change tracking: snapshots, diff report, revert ──────────────────────
+
+def _snapshot_key(project_path: str) -> str:
+    return str(Path(project_path).resolve())
+
+
+def _read_text_or_none(abs_path: str) -> "str | None":
+    """Quietly read a file as UTF-8, or return None if it's missing/unreadable."""
+    p = Path(abs_path)
+    if not p.is_file():
+        return None
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _rel(project_path: str, abs_path: str) -> str:
+    """Best-effort path relative to the project root, for readable reports."""
+    try:
+        return str(Path(abs_path).relative_to(Path(project_path).resolve()))
+    except ValueError:
+        return abs_path
+
+
+def _record_snapshot(project_path: str, abs_path: str) -> None:
+    """Capture a file's pre-edit content once, before its first write this session."""
+    key = _snapshot_key(project_path)
+    with _SNAPSHOT_LOCK:
+        files = _SNAPSHOTS.setdefault(key, {})
+        if abs_path in files:           # already snapshotted — keep the original
+            return
+        files[abs_path] = _read_text_or_none(abs_path)
+
+
+def _build_change_report(project_path: str, file_paths: "list[str] | None" = None) -> str:
+    """Unified-diff report of snapshotted files vs. their current on-disk state."""
+    key = _snapshot_key(project_path)
+    with _SNAPSHOT_LOCK:
+        snapshot = dict(_SNAPSHOTS.get(key, {}))
+
+    if file_paths:
+        targets: list[str] = []
+        for fp in file_paths:
+            try:
+                targets.append(str(_safe_path(fp, project_path)))
+            except ValueError:
+                continue
+    else:
+        targets = list(snapshot.keys())
+
+    if not targets:
+        return "No file changes have been recorded this session."
+
+    parts: list[str] = []
+    for abs_path in targets:
+        before = snapshot.get(abs_path)
+        after = _read_text_or_none(abs_path)
+        rel = _rel(project_path, abs_path)
+
+        if after is None:
+            parts.append(f"=== {rel} ===\n[DELETED]")
+        elif before is None:
+            parts.append(f"=== {rel} ===\n[NEW FILE]\n{after}")
+        elif before == after:
+            parts.append(f"=== {rel} ===\n[UNCHANGED in this session]")
+        else:
+            diff = "".join(difflib.unified_diff(
+                before.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile=f"{rel} (before)",
+                tofile=f"{rel} (after)",
+                n=3,
+            ))
+            parts.append(
+                f"=== {rel} ===\n"
+                f"DIFF (what changed in this session):\n{diff}\n"
+                f"--- FULL FILE AFTER CHANGES ---\n{after}"
+            )
+    return "\n\n".join(parts)
+
+
+def restore_snapshot(project_path: str, file_paths: "list[str] | None" = None) -> tuple[int, int]:
+    """Restore snapshotted files to their pre-edit state. Returns (restored, deleted).
+
+    With no file_paths, reverts every file the agent wrote this session. Called
+    by the UI's revert button; snapshots are kept so a report still reflects the
+    (now reverted) state.
+    """
+    key = _snapshot_key(project_path)
+    with _SNAPSHOT_LOCK:
+        snapshot = _SNAPSHOTS.get(key, {})
+        if file_paths:
+            wanted: set[str] = set()
+            for fp in file_paths:
+                try:
+                    wanted.add(str(_safe_path(fp, project_path)))
+                except ValueError:
+                    continue
+            items = [(p, snapshot[p]) for p in wanted if p in snapshot]
+        else:
+            items = list(snapshot.items())
+
+        restored = deleted = 0
+        for abs_path, content in items:
+            p = Path(abs_path)
+            try:
+                if content is not None:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content, encoding="utf-8")
+                    restored += 1
+                elif p.exists():
+                    p.unlink()
+                    deleted += 1
+            except Exception:
+                continue
+        return restored, deleted
+
+
+def _safe_path(file_path: str, project_path: str) -> Path:
+    """Resolve file_path and confine it to project_path.
+
+    Accepts a relative path (resolved against the project root) or an absolute
+    path, but raises ValueError if the resolved location escapes the project
+    root via ``..`` or an out-of-tree absolute path.
+    """
+    root = Path(project_path).resolve()
+    target = Path(file_path)
+    p = (target if target.is_absolute() else root / target).resolve()
+    if p != root and root not in p.parents:
+        raise ValueError(f"'{file_path}' is outside the project root '{root}'.")
+    return p

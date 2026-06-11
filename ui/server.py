@@ -46,12 +46,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import agents  # noqa: E402  (after chdir/sys.path tweak, by design)
 from langchain_core.messages import AIMessageChunk, ToolMessage  # noqa: E402
+from tools.tools import restore_snapshot  # noqa: E402  (revert button backend)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 SESSIONS_FILE = Path(__file__).resolve().parent / "sessions.json"
 HOST, PORT = "127.0.0.1", 8765
 
-LANGUAGES = ["python", "javascript", "typescript", "go", "rust", "java"]
+LANGUAGES = ["english","python", "javascript", "typescript", "go", "rust", "java"]
 with open("config.yaml", "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 MODELS = []
@@ -61,6 +62,20 @@ for agent in _cfg.get("agents", []):
     else:
         MODELS.append(agent)
 print(MODELS)
+
+# Roles = the prompt "personalities" the user can switch between on the go
+# (code-review, explore, ...). Keys of config.yaml's `prompt:` map.
+ROLES = list(_cfg.get("prompt", {}))
+DEFAULT_ROLE = agents.DEFAULT_ROLE
+print(ROLES)
+
+# Tools each role can run; the UI shows a checkbox per name and the user can
+# disable any of them per session (applied to the next message).
+TOOLS_BY_ROLE = agents.TOOLS_BY_ROLE
+
+
+def _tools_for_role(role: str) -> list[str]:
+    return list(TOOLS_BY_ROLE.get(role, TOOLS_BY_ROLE.get(DEFAULT_ROLE, [])))
 
 # ── session store (in-memory, mirrored to disk for re-reading) ──────────────
 # The agent's own InMemorySaver keeps the LangGraph state per thread_id while
@@ -80,6 +95,9 @@ def _load_sessions() -> None:
             data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
             for s in data.get("sessions", []):
                 s["restored"] = True  # cosmetic badge only — no longer read-only
+                # Back-fill fields added after this session was first saved.
+                s.setdefault("role", DEFAULT_ROLE)
+                s.setdefault("enabled_tools", _tools_for_role(s["role"]))
                 # If the SQLite checkpointer has state for this thread the session
                 # is fully resumable; otherwise the next message re-initialises it.
                 cfg = {"configurable": {"thread_id": s["id"]}}
@@ -100,7 +118,7 @@ def _save_sessions() -> None:
         tmp.replace(SESSIONS_FILE)
 
 
-def _new_session(path: str, language: str, model: str) -> dict:
+def _new_session(path: str, language: str, model: str, role: str) -> dict:
     sid = uuid.uuid4().hex[:12]
     title = Path(path).name or path or "session"
     session = {
@@ -109,6 +127,8 @@ def _new_session(path: str, language: str, model: str) -> dict:
         "path": path,
         "language": language,
         "model": model,
+        "role": role,
+        "enabled_tools": _tools_for_role(role),  # all on by default
         "created": _now_iso(),
         "messages": [],          # [{role, content, ts, usage?, elapsed?}]
         "started": False,        # has the first (stateful) turn run yet?
@@ -203,6 +223,12 @@ def _run_turn(session: dict, user_text: str, emit):
     else:
         payload = {"messages": [{"role": "user", "content": user_text}]}
 
+    # Sent every turn so toggling tools mid-session takes effect immediately.
+    # The tool-gate middleware restricts the model to exactly these names.
+    payload["enabled_tools"] = session.get(
+        "enabled_tools", _tools_for_role(session.get("role", DEFAULT_ROLE))
+    )
+
     started = time.monotonic()
     answer_parts: list[str] = []
     last_usage: dict | None = None
@@ -214,7 +240,7 @@ def _run_turn(session: dict, user_text: str, emit):
     tool_index_by_name: dict[str, int] = {}  # tool name    -> latest index
 
     try:
-        agent = agents._agent_pool.get(session["model"], agents._agent)
+        agent = agents.graph_for(session.get("role"), session.get("model"))
         for chunk, _meta in agent.stream(
             payload, config=config, stream_mode="messages"
         ):
@@ -235,6 +261,12 @@ def _run_turn(session: dict, user_text: str, emit):
                     idx = tc.get("index") or 0
                     if tc.get("id"):
                         tool_index_by_id[tc["id"]] = idx
+                        # A new tool-call id reuses index 0 on each ReAct step;
+                        # reset the accumulator so this call's args aren't
+                        # concatenated onto the previous call's (which produced
+                        # invalid JSON -> no target -> a generic "project" label
+                        # for every read/write after the first).
+                        tool_args[idx] = ""
                     frag = tc.get("args")
                     if frag:
                         tool_args[idx] = tool_args.get(idx, "") + frag
@@ -360,6 +392,8 @@ class Handler(BaseHTTPRequestHandler):
                                    key=lambda s: s["created"]),
                 "languages": LANGUAGES,
                 "models": MODELS,
+                "roles": ROLES,
+                "tools_by_role": TOOLS_BY_ROLE,
             })
         else:
             self._send_json({"error": "not found"}, 404)
@@ -374,6 +408,7 @@ class Handler(BaseHTTPRequestHandler):
             path = (data.get("path") or "").strip()
             language = (data.get("language") or "").strip().lower()
             model = (data.get("model") or "").strip().lower()
+            role = (data.get("role") or DEFAULT_ROLE).strip()
             if not path:
                 self._send_json({"error": "path is required"}, 400)
                 return
@@ -383,7 +418,10 @@ class Handler(BaseHTTPRequestHandler):
             if model not in MODELS:
                 self._send_json({"error": f"unknown model '{model}'"}, 400)
                 return
-            session = _new_session(path, language,model)
+            if role not in ROLES:
+                self._send_json({"error": f"unknown role '{role}'"}, 400)
+                return
+            session = _new_session(path, language, model, role)
             self._send_json({"session": session})
         elif route == "/api/session/model":
             data = self._read_body()
@@ -399,6 +437,64 @@ class Handler(BaseHTTPRequestHandler):
             session["model"] = new_model
             _save_sessions()
             self._send_json({"ok": True, "model": new_model})
+        elif route == "/api/session/role":
+            data = self._read_body()
+            sid = data.get("id")
+            new_role = (data.get("role") or "").strip()
+            session = _sessions.get(sid)
+            if not session:
+                self._send_json({"error": "unknown session"}, 404)
+                return
+            if new_role not in ROLES:
+                self._send_json({"error": f"unknown role '{new_role}'"}, 400)
+                return
+            # Same thread_id -> the next turn keeps the full history but is
+            # handled by the new role's prompt (and tools). Roles can expose
+            # different tools, so reset the toggle set to the new role's full
+            # list (all enabled).
+            session["role"] = new_role
+            session["enabled_tools"] = _tools_for_role(new_role)
+            _save_sessions()
+            self._send_json({
+                "ok": True,
+                "role": new_role,
+                "tools": _tools_for_role(new_role),       # selectable set
+                "enabled_tools": session["enabled_tools"],  # currently enabled
+            })
+        elif route == "/api/session/tools":
+            data = self._read_body()
+            sid = data.get("id")
+            requested = data.get("enabled_tools")
+            session = _sessions.get(sid)
+            if not session:
+                self._send_json({"error": "unknown session"}, 404)
+                return
+            if not isinstance(requested, list):
+                self._send_json({"error": "enabled_tools must be a list"}, 400)
+                return
+            # Keep only names this session's role actually offers, preserving the
+            # role's canonical tool order.
+            allowed = _tools_for_role(session.get("role", DEFAULT_ROLE))
+            session["enabled_tools"] = [t for t in allowed if t in requested]
+            _save_sessions()
+            self._send_json({"ok": True, "enabled_tools": session["enabled_tools"]})
+        elif route == "/api/session/revert":
+            data = self._read_body()
+            sid = data.get("id")
+            # A single path (from a write bubble) or None to revert everything.
+            path = data.get("path")
+            session = _sessions.get(sid)
+            if not session:
+                self._send_json({"error": "unknown session"}, 404)
+                return
+            paths = [path] if isinstance(path, str) and path.strip() else None
+            restored, deleted = restore_snapshot(session["path"], paths)
+            if not restored and not deleted:
+                self._send_json(
+                    {"error": "Nothing to revert — no snapshot for this file "
+                              "(it may predate this server run)."}, 404)
+                return
+            self._send_json({"ok": True, "restored": restored, "deleted": deleted})
         elif route == "/api/session/delete":
             data = self._read_body()
             sid = data.get("id")

@@ -6,6 +6,8 @@ const state = {
   activeId: null,
   languages: [],
   models: [],
+  roles: [],
+  toolsByRole: {},
   streaming: false,      // is an agent turn currently running?
   streamingId: null,     // tracks which session is streaming
   queue: [],             // follow-up messages waiting to be sent
@@ -70,8 +72,11 @@ async function refreshSessions() {
     state.sessions = data.sessions || [];
     state.languages = data.languages || [];
     state.models = data.models || [];
+    state.roles = data.roles || [];
+    state.toolsByRole = data.tools_by_role || {};
     populateLanguages();
     populateModels();
+    populateRoles();
     renderSessionList();
     if (!state.activeId && state.sessions.length) {
       selectSession(state.sessions[state.sessions.length - 1].id);
@@ -103,6 +108,16 @@ function populateModels(){
   }
 }
 
+function populateRoles(){
+  const sel = $("role-select");
+  if(sel.options.length) return; // only once
+  for (const role of state.roles){
+    const o = el("option", null, role);
+    o.value = role;
+    sel.appendChild(o);
+  }
+}
+
 // ── UI bindings ────────────────────────────────────────────────────────
 function bindUI() {
   $("browse-btn").addEventListener("click", browseFolder);
@@ -112,6 +127,7 @@ function bindUI() {
   $("theme-toggle").addEventListener("click", toggleTheme);
   $("send-btn").addEventListener("click", onSend);
   $("model-switch").addEventListener("change", (e) => switchModel(e.target.value));
+  $("role-switch").addEventListener("change", (e) => switchRole(e.target.value));
 
   const input = $("message-input");
   input.addEventListener("keydown", (e) => {
@@ -160,7 +176,7 @@ async function startSession() {
     const res = await fetch("/api/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, language, model: $("model-select").value }),
+      body: JSON.stringify({ path, language, model: $("model-select").value, role: $("role-select").value }),
     });
     const data = await res.json();
     if (data.error) { errBox.textContent = data.error; return; }
@@ -261,10 +277,86 @@ async function switchModel(newModel) {
     const data = await res.json();
     if (data.error) { alert(data.error); return; }
     s.model = data.model;
-    $("chat-subtitle").textContent = `${s.path}  ·  ${s.language}  ·  ${s.model}`;
+    $("chat-subtitle").textContent = subtitleFor(s);
   } catch (e) {
     console.error(e);
     alert("Could not switch model.");
+  }
+}
+
+async function switchRole(newRole) {
+  const s = activeSession();
+  if (!s || s.restored) return;
+  try {
+    const res = await fetch("/api/session/role", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: s.id, role: newRole }),
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    s.role = data.role;
+    if (data.enabled_tools) s.enabled_tools = data.enabled_tools;  // reset for new role
+    $("chat-subtitle").textContent = subtitleFor(s);
+    renderTools(s);
+  } catch (e) {
+    console.error(e);
+    alert("Could not switch role.");
+  }
+}
+
+// One source of truth for the header subtitle: path · language · model · role.
+function subtitleFor(s) {
+  return `${s.path}  ·  ${s.language}  ·  ${s.model}` + (s.role ? `  ·  ${s.role}` : "");
+}
+
+// ── Tool toggles (per session, applied to the next message) ─────────────
+function renderTools(s) {
+  const ul = $("tool-toggles");
+  ul.innerHTML = "";
+  const tools = (s && state.toolsByRole[s.role]) || [];
+  if (!s || !tools.length) {
+    ul.innerHTML = '<li class="muted text-gray-400 dark:text-slate-500">no session</li>';
+    return;
+  }
+  const enabled = new Set(s.enabled_tools || tools);
+  for (const name of tools) {
+    const li = el("li", "flex items-center gap-2");
+    const cb = el("input");
+    cb.type = "checkbox";
+    cb.id = "tool-cb-" + name;
+    cb.checked = enabled.has(name);
+    cb.className = "accent-blue-600 cursor-pointer";
+    cb.addEventListener("change", () => toggleTool(name, cb.checked));
+    const label = el("label", "cursor-pointer select-none font-mono text-[11px] truncate", name);
+    label.htmlFor = cb.id;
+    li.appendChild(cb);
+    li.appendChild(label);
+    ul.appendChild(li);
+  }
+}
+
+async function toggleTool(name, on) {
+  const s = activeSession();
+  if (!s) return;
+  const tools = state.toolsByRole[s.role] || [];
+  const set = new Set(s.enabled_tools || tools);
+  if (on) set.add(name); else set.delete(name);
+  const enabled = tools.filter((t) => set.has(t));  // keep canonical order
+  s.enabled_tools = enabled;  // optimistic
+  try {
+    const res = await fetch("/api/session/tools", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: s.id, enabled_tools: enabled }),
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); renderTools(s); return; }
+    s.enabled_tools = data.enabled_tools;
+  } catch (e) {
+    console.error(e);
+    alert("Could not update tools.");
+    renderTools(s);
   }
 }
 
@@ -279,14 +371,15 @@ function renderActive() {
     $("restored-badge").classList.add("hidden");
     setComposerEnabled(false);
     resetStats();
+    renderTools(null);
     return;
   }
 
   $("chat-title").textContent = s.title;
-  $("chat-subtitle").textContent = `${s.path}  ·  ${s.language}  ·  ${s.model}`;
+  $("chat-subtitle").textContent = subtitleFor(s);
   $("restored-badge").classList.toggle("hidden", !s.restored);
 
-  // Populate and sync the in-header model switcher
+  // Populate and sync the in-header model + role switchers
   const sw = $("model-switch");
   sw.innerHTML = "";
   for (const m of state.models) {
@@ -295,8 +388,23 @@ function renderActive() {
     if (m === s.model) o.selected = true;
     sw.appendChild(o);
   }
-  sw.classList.add("hidden");  // shown below once streaming check passes
-  if (!state.streaming) sw.classList.remove("hidden");
+
+  const rsw = $("role-switch");
+  rsw.innerHTML = "";
+  for (const r of state.roles) {
+    const o = el("option", null, r);
+    o.value = r;
+    if (r === s.role) o.selected = true;
+    rsw.appendChild(o);
+  }
+
+  // Hide both switchers while streaming, show them once idle.
+  sw.classList.add("hidden");
+  rsw.classList.add("hidden");
+  if (!state.streaming) {
+    sw.classList.remove("hidden");
+    rsw.classList.remove("hidden");
+  }
 
   for (const m of s.messages) {
     addMessageBubble(m.role, m.content, m.ts, m);
@@ -309,6 +417,7 @@ function renderActive() {
   updateComposerMode();
 
   renderStatsFor(s);
+  renderTools(s);
   scrollMessages();
 }
 
@@ -675,28 +784,78 @@ function renderToolBubble(evt, aiBubble) {
 }
 
 function buildToolBubble(name, target, done) {
-  const wrap = el("div",
-    "self-start flex items-center gap-2 max-w-[80%] text-xs px-3 py-1.5 rounded-lg " +
-    "bg-violet-50 dark:bg-violet-950/40 border border-violet-200 dark:border-violet-800/60 " +
-    "text-violet-700 dark:text-violet-300");
+  const isWrite = name === "write_file";
+  // Writes get a distinct amber tint so they read clearly apart from reads.
+  const wrap = el("div", isWrite
+    ? "self-start flex items-center gap-2 max-w-[80%] text-xs px-3 py-1.5 rounded-lg " +
+      "bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 " +
+      "text-amber-700 dark:text-amber-300"
+    : "self-start flex items-center gap-2 max-w-[80%] text-xs px-3 py-1.5 rounded-lg " +
+      "bg-violet-50 dark:bg-violet-950/40 border border-violet-200 dark:border-violet-800/60 " +
+      "text-violet-700 dark:text-violet-300");
 
-  const icon = el("span", done
-    ? "text-violet-500 dark:text-violet-400"
-    : "text-violet-500 dark:text-violet-400 animate-spin inline-block", done ? "🔧" : "⟳");
+  const accent = isWrite
+    ? "text-amber-500 dark:text-amber-400"
+    : "text-violet-500 dark:text-violet-400";
+  const icon = el("span", done ? accent : accent + " animate-spin inline-block",
+    done ? (isWrite ? "📝" : "🔧") : "⟳");
   wrap.appendChild(icon);
   wrap.appendChild(el("span", "font-semibold", name));
 
   if (target) {
-    const sep = el("span", "text-violet-300 dark:text-violet-700", "·");
+    const sep = el("span", isWrite
+      ? "text-amber-300 dark:text-amber-700" : "text-violet-300 dark:text-violet-700", "·");
     wrap.appendChild(sep);
-    const detail = el("span", "font-mono text-[11px] text-violet-500 dark:text-violet-400/90 truncate");
+    const detail = el("span", "font-mono text-[11px] truncate " + (isWrite
+      ? "text-amber-600 dark:text-amber-400/90" : "text-violet-500 dark:text-violet-400/90"));
     detail.title = target.path;
     detail.textContent = `📄 ${target.name}` + (target.dir && target.dir !== "." ? `  📁 ${target.dir}` : "");
     wrap.appendChild(detail);
+
+    // Writes are snapshotted server-side; offer a one-click undo to the
+    // file's state from before the agent first edited it (this session only).
+    if (isWrite && done) {
+      const btn = el("button",
+        "flex-none text-[11px] px-1.5 py-0.5 rounded border " +
+        "border-amber-300 dark:border-amber-700/70 hover:bg-amber-500/10 transition-colors",
+        "↩ revert");
+      btn.title = "Restore this file to its state before the agent edited it";
+      btn.addEventListener("click", () => revertFile(target.path, btn));
+      wrap.appendChild(btn);
+    }
   } else if (done) {
-    wrap.appendChild(el("span", "text-violet-400 dark:text-violet-500 italic", "project"));
+    wrap.appendChild(el("span",
+      (isWrite ? "text-amber-400 dark:text-amber-500" : "text-violet-400 dark:text-violet-500") + " italic",
+      "project"));
   }
   return wrap;
+}
+
+// Restore a written file to its pre-edit snapshot via the backend.
+async function revertFile(path, btn) {
+  const s = activeSession();
+  if (!s) return;
+  if (!confirm(`Revert "${path}" to its state before the agent edited it?`)) return;
+  const original = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  try {
+    const res = await fetch("/api/session/revert", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: s.id, path }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      alert(data.error);
+      if (btn) { btn.disabled = false; btn.textContent = original; }
+      return;
+    }
+    if (btn) { btn.textContent = "✓ reverted"; btn.classList.add("opacity-60"); }
+  } catch (e) {
+    console.error(e);
+    alert("Could not revert the file.");
+    if (btn) { btn.disabled = false; btn.textContent = original; }
+  }
 }
 
 init();
