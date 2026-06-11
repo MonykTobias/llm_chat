@@ -4,13 +4,13 @@ from string import Template
 from typing import Any, List
 
 from agents.base import BaseAgent
+from tools.tools import list_all_files, web_browse
 
-DEFAULT_REVIEW_TOOLS = []
+DEFAULT_REVIEW_TOOLS = [web_browse,list_all_files]
 
 class TextingAgent(BaseAgent):
     """A conversational text assistant with no tools — pure chat mode."""
 
-    name = "texting_agent"
     kickoff_message = "Hi! I'm your friendly chat companion. Ask me anything or just say hello!"
 
     def __init__(

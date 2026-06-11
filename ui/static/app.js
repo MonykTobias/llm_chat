@@ -10,10 +10,14 @@ const state = {
   toolsByRole: {},
   streaming: false,      // is an agent turn currently running?
   streamingId: null,     // tracks which session is streaming
-  queue: [],             // follow-up messages waiting to be sent
+  queue: [],             // follow-up messages waiting to be sent: {text, attachments}
+  attachments: [],       // pending files for the next message: {name,type,size,data}
   timer: null,           // live response-time interval handle
   turnStart: 0,
 };
+
+// Per-file size guard so a giant drop can't lock up the browser / blow context.
+const MAX_ATTACH_BYTES = 15 * 1024 * 1024; // 15 MB
 
 // ── DOM helpers ────────────────────────────────────────────────────────
 const $ = (id) => document.getElementById(id);
@@ -137,6 +141,115 @@ function bindUI() {
     }
   });
   input.addEventListener("input", () => autoGrow(input));
+  // Paste images / files straight into the composer.
+  input.addEventListener("paste", (e) => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    const files = [];
+    for (const it of items) {
+      if (it.kind === "file") { const f = it.getAsFile(); if (f) files.push(f); }
+    }
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
+
+  // Attachments: file picker button + hidden input.
+  $("attach-btn").addEventListener("click", () => $("file-input").click());
+  $("file-input").addEventListener("change", (e) => {
+    addFiles(e.target.files);
+    e.target.value = "";  // allow re-selecting the same file
+  });
+
+  bindDragAndDrop();
+}
+
+// ── Drag & drop files onto the chat pane ───────────────────────────────
+function bindDragAndDrop() {
+  const pane = $("chat-pane");
+  const overlay = $("drop-overlay");
+  const hasFiles = (e) =>
+    e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+
+  let depth = 0;  // track nested dragenter/leave so the overlay doesn't flicker
+  pane.addEventListener("dragenter", (e) => {
+    if (!hasFiles(e) || !activeSession()) return;
+    e.preventDefault();
+    depth++;
+    overlay.classList.remove("hidden");
+  });
+  pane.addEventListener("dragover", (e) => {
+    if (!hasFiles(e) || !activeSession()) return;
+    e.preventDefault();  // required to allow a drop
+  });
+  pane.addEventListener("dragleave", (e) => {
+    if (!hasFiles(e)) return;
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) overlay.classList.add("hidden");
+  });
+  pane.addEventListener("drop", (e) => {
+    depth = 0;
+    overlay.classList.add("hidden");
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    if (!activeSession()) return;
+    if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  });
+}
+
+// ── Attachments (pending files for the next message) ───────────────────
+function addFiles(fileList) {
+  for (const f of Array.from(fileList || [])) {
+    if (f.size > MAX_ATTACH_BYTES) {
+      alert(`"${f.name}" is too large (max 15 MB).`);
+      continue;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      state.attachments.push({
+        name: f.name, type: f.type || "", size: f.size, data: reader.result,
+      });
+      renderAttachments();
+    };
+    reader.onerror = () => alert(`Could not read "${f.name}".`);
+    reader.readAsDataURL(f);  // -> "data:<mime>;base64,<payload>"
+  }
+}
+
+function removeAttachment(i) {
+  state.attachments.splice(i, 1);
+  renderAttachments();
+}
+
+function fileIcon(type, name) {
+  type = type || "";
+  if (type.startsWith("image/")) return "🖼️";
+  if (type === "application/pdf" || /\.pdf$/i.test(name || "")) return "📕";
+  return "📄";
+}
+
+function renderAttachments() {
+  const box = $("attachment-preview");
+  box.innerHTML = "";
+  if (!state.attachments.length) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  state.attachments.forEach((a, i) => {
+    const chip = el("div",
+      "flex items-center gap-1.5 text-xs pl-1.5 pr-1 py-1 rounded-lg bg-gray-100 dark:bg-slate-800 " +
+      "border border-gray-200 dark:border-slate-700 text-gray-700 dark:text-slate-200");
+    if ((a.type || "").startsWith("image/") && a.data) {
+      const img = el("img", "w-7 h-7 object-cover rounded");
+      img.src = a.data;
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(el("span", "text-base", fileIcon(a.type, a.name)));
+    }
+    chip.appendChild(el("span", "font-mono truncate max-w-[140px]", a.name));
+    const x = el("button",
+      "flex-none w-5 h-5 flex items-center justify-center rounded text-gray-400 hover:text-red-500 hover:bg-red-500/10 transition-colors",
+      "✕");
+    x.title = "Remove";
+    x.addEventListener("click", () => removeAttachment(i));
+    chip.appendChild(x);
+    box.appendChild(chip);
+  });
 }
 
 function autoGrow(t) {
@@ -424,6 +537,7 @@ function renderActive() {
 function setComposerEnabled(enabled) {
   $("message-input").disabled = !enabled;
   $("send-btn").disabled = !enabled;
+  $("attach-btn").disabled = !enabled;
 }
 
 // Reflect whether the next submit will send immediately or queue behind the
@@ -442,6 +556,14 @@ function addMessageBubble(role, content, ts, meta) {
   const wrap = el("div",
     "flex flex-col gap-1 max-w-[80%] " + (isUser ? "self-end items-end" : "self-start items-start"));
 
+  // Attachments (user messages only): thumbnails for images, pills for files.
+  const atts = (meta && meta.attachments) || [];
+  if (isUser && atts.length) {
+    const row = el("div", "flex flex-wrap gap-1.5 justify-end");
+    for (const a of atts) row.appendChild(attachmentThumb(a));
+    wrap.appendChild(row);
+  }
+
   const bubble = el("div",
     isUser
       ? "px-3.5 py-2.5 rounded-2xl rounded-br-sm bg-blue-600 text-white text-sm leading-relaxed whitespace-pre-wrap break-words"
@@ -453,7 +575,8 @@ function addMessageBubble(role, content, ts, meta) {
     bubble.textContent = content;
   }
 
-  wrap.appendChild(bubble);
+  // Skip an empty bubble when a user message carries only attachments.
+  if (content || !isUser || !atts.length) wrap.appendChild(bubble);
   let metaText = fmtTime(ts);
   if (role === "assistant" && meta && meta.elapsed != null) {
     metaText += `  ·  ${meta.elapsed}s`;
@@ -465,6 +588,26 @@ function addMessageBubble(role, content, ts, meta) {
   wrap.appendChild(el("div", "text-[11px] text-gray-400 dark:text-slate-500", metaText));
   $("messages").appendChild(wrap);
   return bubble;
+}
+
+// One attachment in a sent message: an image thumbnail when we still have the
+// data (live turn), otherwise a labelled pill. Re-opened sessions only keep
+// {name,type,size} metadata, so they always show the pill.
+function attachmentThumb(a) {
+  if ((a.type || "").startsWith("image/") && a.data) {
+    const img = el("img",
+      "max-w-[180px] max-h-[180px] rounded-lg border border-blue-300 dark:border-blue-700");
+    img.src = a.data;
+    img.title = a.name;
+    return img;
+  }
+  const pill = el("div",
+    "flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg bg-blue-50 dark:bg-blue-950/40 " +
+    "border border-blue-200 dark:border-blue-800/60 text-blue-700 dark:text-blue-300");
+  pill.appendChild(el("span", "text-base", fileIcon(a.type, a.name)));
+  pill.appendChild(el("span", "font-mono truncate max-w-[180px]", a.name));
+  pill.title = a.name;
+  return pill;
 }
 
 function scrollMessages() {
@@ -480,15 +623,18 @@ function scrollMessages() {
 function onSend() {
   const input = $("message-input");
   const text = input.value.trim();
-  if (!text || input.disabled) return;
+  const attachments = state.attachments;
+  if ((!text && !attachments.length) || input.disabled) return;
   input.value = "";
   autoGrow(input);
+  state.attachments = [];  // hand the pending files off to this message
+  renderAttachments();
 
   if (state.streaming && state.activeId === state.streamingId) {
-    state.queue.push(text);
+    state.queue.push({ text, attachments });
     renderQueue();
   } else {
-    sendMessage(text);
+    sendMessage(text, attachments);
   }
 }
 
@@ -497,19 +643,22 @@ function renderQueue() {
   if (!state.queue.length) { q.classList.add("hidden"); return; }
   q.classList.remove("hidden");
   q.textContent = `⏳ ${state.queue.length} queued: ` +
-    state.queue.map((m) => `"${m.length > 30 ? m.slice(0, 30) + "…" : m}"`).join(", ");
+    state.queue.map((m) => {
+      const label = m.text || `📎 ${m.attachments.length} file(s)`;
+      return `"${label.length > 30 ? label.slice(0, 30) + "…" : label}"`;
+    }).join(", ");
 }
 
 function drainQueue() {
   if (state.queue.length && !state.streaming) {
     const next = state.queue.shift();
     renderQueue();
-    sendMessage(next);
+    sendMessage(next.text, next.attachments);
   }
 }
 
 // ── The streaming turn ─────────────────────────────────────────────────
-async function sendMessage(text) {
+async function sendMessage(text, attachments = []) {
   const s = activeSession();
   if (!s) return;
 
@@ -521,7 +670,7 @@ async function sendMessage(text) {
   updateComposerMode();
 
   const userTs = new Date().toISOString();
-  addMessageBubble("user", text, userTs);
+  addMessageBubble("user", text, userTs, { attachments });
   scrollMessages();
 
   const aiBubble = addMessageBubble("assistant", "", new Date().toISOString());
@@ -539,7 +688,7 @@ async function sendMessage(text) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: s.id, message: text }),
+      body: JSON.stringify({ session_id: s.id, message: text, attachments }),
     });
 
     reader = res.body.getReader();
@@ -785,22 +934,43 @@ function renderToolBubble(evt, aiBubble) {
 
 function buildToolBubble(name, target, done) {
   const isWrite = name === "write_file";
-  // Writes get a distinct amber tint so they read clearly apart from reads.
-  const wrap = el("div", isWrite
-    ? "self-start flex items-center gap-2 max-w-[80%] text-xs px-3 py-1.5 rounded-lg " +
-      "bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 " +
-      "text-amber-700 dark:text-amber-300"
-    : "self-start flex items-center gap-2 max-w-[80%] text-xs px-3 py-1.5 rounded-lg " +
-      "bg-violet-50 dark:bg-violet-950/40 border border-violet-200 dark:border-violet-800/60 " +
-      "text-violet-700 dark:text-violet-300");
+  const isWeb = name === "web_browse";
+  // Writes get a distinct amber tint, web browsing a sky tint, so each reads
+  // clearly apart from the violet reads.
+  const wrap = el("div",
+    "self-start flex items-center gap-2 max-w-[80%] text-xs px-3 py-1.5 rounded-lg " + (isWrite
+      ? "bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 " +
+        "text-amber-700 dark:text-amber-300"
+      : isWeb
+      ? "bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 " +
+        "text-sky-700 dark:text-sky-300"
+      : "bg-violet-50 dark:bg-violet-950/40 border border-violet-200 dark:border-violet-800/60 " +
+        "text-violet-700 dark:text-violet-300"));
 
   const accent = isWrite
     ? "text-amber-500 dark:text-amber-400"
+    : isWeb
+    ? "text-sky-500 dark:text-sky-400"
     : "text-violet-500 dark:text-violet-400";
   const icon = el("span", done ? accent : accent + " animate-spin inline-block",
-    done ? (isWrite ? "📝" : "🔧") : "⟳");
+    done ? (isWrite ? "📝" : isWeb ? "🌐" : "🔧") : "⟳");
   wrap.appendChild(icon);
   wrap.appendChild(el("span", "font-semibold", name));
+
+  // web_browse: show the site searched and the query, mirroring the file label.
+  if (isWeb && target && (target.url || target.query)) {
+    const sep = el("span", "text-sky-300 dark:text-sky-700", "·");
+    wrap.appendChild(sep);
+    const detail = el("span",
+      "font-mono text-[11px] truncate text-sky-600 dark:text-sky-400/90");
+    const bits = [];
+    if (target.url) bits.push(`🔗 ${target.url}`);
+    if (target.query) bits.push(`🔎 ${target.query}`);
+    detail.textContent = bits.join("  ");
+    detail.title = bits.join("  ");
+    wrap.appendChild(detail);
+    return wrap;
+  }
 
   if (target) {
     const sep = el("span", isWrite

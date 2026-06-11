@@ -76,7 +76,7 @@ _BUILD_OPTS = dict(
 # built with CodeReviewAgent (the default). A custom class that loads its
 # template from config only needs ONE line here — WIRE A NEW AGENT HERE.
 AGENT_CLASSES: dict[str, type[BaseAgent]] = {
-    "texting_agent": TextingAgent,
+    "casual": TextingAgent,
     "cr_explore" : CodeReviewExplore,
     "cr_plan": CodeReviewPlan,
     "cr_act" : CodeReviewAct,

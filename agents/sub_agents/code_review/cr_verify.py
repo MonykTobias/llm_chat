@@ -6,7 +6,7 @@ from typing import Any, List
 from agents.base import BaseAgent
 from tools.tools import (
     list_all_files, read_file, analyze_architecture,
-    run_type_check, run_tests, run_linter, build_change_report,
+    run_type_check, run_tests, run_linter, build_change_report, web_browse,
 )
 
 DEFAULT_REVIEW_TOOLS = [
@@ -17,6 +17,7 @@ DEFAULT_REVIEW_TOOLS = [
     run_tests,
     run_type_check,
     build_change_report,
+    web_browse,
 ]
 
 class CodeReviewVerify(BaseAgent):

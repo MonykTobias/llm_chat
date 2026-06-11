@@ -68,7 +68,16 @@
     </aside>
 
     <!-- ── Chat Pane ───────────────────────────────────────────────── -->
-    <main id="chat-pane" class="flex-1 flex flex-col min-w-0">
+    <main id="chat-pane" class="relative flex-1 flex flex-col min-w-0">
+
+      <!-- Drag-and-drop overlay (shown while files are dragged over the pane) -->
+      <div id="drop-overlay" class="hidden absolute inset-0 z-20 flex items-center justify-center bg-blue-500/15 backdrop-blur-sm border-2 border-dashed border-blue-500 rounded-lg pointer-events-none">
+        <div class="text-center">
+          <div class="text-4xl mb-2">📎</div>
+          <p class="text-base font-semibold text-blue-700 dark:text-blue-300">Drop files to attach</p>
+          <p class="text-xs text-blue-600/80 dark:text-blue-400/80 mt-1">images, PDFs, code &amp; text files</p>
+        </div>
+      </div>
 
       <!-- Header -->
       <header id="chat-header" class="flex items-center gap-2.5 px-4 py-3 bg-white dark:bg-slate-900 border-b border-gray-200 dark:border-slate-700/60 flex-shrink-0">
@@ -101,7 +110,14 @@
       <!-- Composer -->
       <div id="composer" class="border-t border-gray-200 dark:border-slate-700/60 px-4 py-3 bg-white dark:bg-slate-900 flex-shrink-0">
         <div id="queue-indicator" class="hidden text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900/60 rounded-lg px-3 py-2 mb-2.5"></div>
+        <!-- Pending attachments for the next message (drag-drop / paste / picker) -->
+        <div id="attachment-preview" class="hidden flex flex-wrap gap-2 mb-2.5"></div>
         <div class="flex gap-2.5 items-end">
+          <input id="file-input" type="file" multiple class="hidden" />
+          <button id="attach-btn" title="Attach files (or drag &amp; drop / paste)"
+            class="flex-none w-10 h-10 flex items-center justify-center rounded-xl bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-300 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-base disabled:opacity-50 disabled:cursor-not-allowed">
+            📎
+          </button>
           <textarea id="message-input" rows="1" placeholder="Ask a follow-up question…"
             class="flex-1 resize-none max-h-40 px-3 py-2.5 rounded-xl border border-gray-200 dark:border-slate-700 bg-gray-100 dark:bg-slate-800 text-gray-900 dark:text-slate-100 placeholder-gray-400 dark:placeholder-slate-500 text-sm font-[inherit] leading-relaxed focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"></textarea>
           <button id="send-btn"
@@ -109,7 +125,7 @@
             Send
           </button>
         </div>
-        <p class="text-xs text-gray-400 dark:text-slate-500 mt-2">Enter to send · Shift+Enter for newline · follow-ups queue while the agent is working</p>
+        <p class="text-xs text-gray-400 dark:text-slate-500 mt-2">Enter to send · Shift+Enter for newline · drag, paste or 📎 to attach files · follow-ups queue while the agent is working</p>
       </div>
     </main>
 

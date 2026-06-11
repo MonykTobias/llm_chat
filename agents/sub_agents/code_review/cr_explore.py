@@ -4,12 +4,13 @@ from string import Template
 from typing import Any, List
 
 from agents.base import BaseAgent
-from tools.tools import list_all_files, read_file, analyze_architecture
+from tools.tools import list_all_files, read_file, analyze_architecture, web_browse
 
 DEFAULT_REVIEW_TOOLS = [
     read_file,
     list_all_files,
     analyze_architecture,
+    web_browse,
 ]
 
 class CodeReviewExplore(BaseAgent):

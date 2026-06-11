@@ -24,6 +24,8 @@ Endpoints
 """
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import subprocess
@@ -198,11 +200,150 @@ def _extract_target(args_str: str) -> dict | None:
                 "dir": os.path.dirname(val) or ".",
                 "name": os.path.basename(val) or val,
             }
+    # web_browse has no path-like arg — surface the site + query instead so the
+    # chat bubble can show what was searched (mirrors read/write file labels).
+    url = data.get("url")
+    query = data.get("query")
+    if (isinstance(url, str) and url.strip()) or (isinstance(query, str) and query.strip()):
+        return {
+            "url": url.strip() if isinstance(url, str) and url.strip() else None,
+            "query": query.strip() if isinstance(query, str) and query.strip() else None,
+        }
     return None
 
 
+# ── attachment handling (drag-and-drop files from the UI) ───────────────────
+# The browser sends each attachment as {name, type, size, data}, where `data`
+# is a base64 data URL. We turn them into LangChain content blocks: images
+# become multimodal image blocks (understood by vision-capable Ollama models),
+# while text and PDF files are extracted to text and embedded inline so ANY
+# model can use them. Unreadable binaries are noted but not sent.
+_TEXT_EXTS = {
+    ".txt", ".md", ".markdown", ".rst", ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv", ".tsv", ".html",
+    ".css", ".scss", ".xml", ".sh", ".bat", ".ps1", ".java", ".c", ".h", ".cpp",
+    ".hpp", ".cc", ".cs", ".go", ".rs", ".rb", ".php", ".sql", ".log", ".env",
+    ".gitignore", ".dockerfile", ".kt", ".swift", ".r", ".lua", ".pl",
+}
+_TEXT_MIMES = {
+    "application/json", "application/xml", "application/x-yaml",
+    "application/javascript", "application/typescript", "application/x-sh",
+    "application/x-python", "application/sql",
+}
+_MAX_ATTACH_TEXT_CHARS = 20_000  # per-file cap so a huge paste can't blow the context
+
+
+def _data_url_bytes(data_url: str) -> "bytes | None":
+    """Decode a `data:<mime>;base64,<payload>` URL (or bare base64) into bytes."""
+    if not isinstance(data_url, str) or not data_url:
+        return None
+    try:
+        payload = data_url.split(",", 1)[1] if "," in data_url else data_url
+        return base64.b64decode(payload)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _looks_textual(name: str, mime: str) -> bool:
+    return (
+        mime.startswith("text/")
+        or mime in _TEXT_MIMES
+        or Path(name).suffix.lower() in _TEXT_EXTS
+    )
+
+
+def _extract_pdf_text(raw: bytes) -> "str | None":
+    """Best-effort PDF text extraction; None if no parser is installed/usable."""
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except Exception:  # noqa: BLE001
+        try:
+            from PyPDF2 import PdfReader  # type: ignore
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _attachment_blocks(att: dict) -> list[dict]:
+    """Convert one UI attachment into one or more LangChain content blocks."""
+    name = str(att.get("name") or "file")
+    mime = str(att.get("type") or "")
+    data_url = att.get("data") or ""
+
+    # Images -> multimodal block (used by vision-capable Ollama models; a
+    # text-only model simply ignores it).
+    if mime.startswith("image/"):
+        return [{"type": "image_url", "image_url": {"url": data_url}}]
+
+    raw = _data_url_bytes(data_url)
+    if raw is None:
+        return [{"type": "text", "text": f"\n[attachment `{name}` could not be decoded]\n"}]
+
+    # PDFs -> extracted text.
+    if mime == "application/pdf" or name.lower().endswith(".pdf"):
+        text = _extract_pdf_text(raw)
+        if text:
+            return [{"type": "text",
+                     "text": f"\n[attached PDF: `{name}`]\n```\n"
+                             f"{text[:_MAX_ATTACH_TEXT_CHARS]}\n```\n"}]
+        return [{"type": "text",
+                 "text": f"\n[attached PDF `{name}` — text could not be extracted "
+                         f"(install `pypdf` to enable PDF reading)]\n"}]
+
+    # Text / code files -> inline fenced block tagged with the file's extension.
+    if _looks_textual(name, mime):
+        text = raw.decode("utf-8", errors="replace")[:_MAX_ATTACH_TEXT_CHARS]
+        lang = Path(name).suffix.lstrip(".").lower()
+        return [{"type": "text",
+                 "text": f"\n[attached file: `{name}`]\n```{lang}\n{text}\n```\n"}]
+
+    # Anything else: raw binary can't be fed to a text model.
+    return [{"type": "text",
+             "text": f"\n[attachment `{name}` ({mime or 'unknown type'}) is binary "
+                     f"and was not included]\n"}]
+
+
+def _build_user_content(user_text: str, attachments: "list | None"):
+    """Message content for one user turn.
+
+    Returns a plain string when there are no attachments (the common case), or a
+    list of content blocks (text + images + extracted file text) when there are.
+    """
+    if not attachments:
+        return user_text
+    blocks: list[dict] = []
+    if user_text:
+        blocks.append({"type": "text", "text": user_text})
+    for att in attachments:
+        if isinstance(att, dict):
+            blocks.extend(_attachment_blocks(att))
+    return blocks or user_text
+
+
+def _attachment_meta(attachments: "list | None") -> list[dict]:
+    """Lightweight {name,type,size} records for the saved transcript.
+
+    The raw bytes are deliberately NOT persisted to sessions.json (they live in
+    the SQLite checkpoint for the model's benefit); the transcript only needs
+    enough to show a chip when an old session is re-opened.
+    """
+    meta: list[dict] = []
+    for att in attachments or []:
+        if isinstance(att, dict):
+            meta.append({
+                "name": str(att.get("name") or "file"),
+                "type": str(att.get("type") or ""),
+                "size": int(att.get("size") or 0),
+            })
+    return meta
+
+
 # ── the streaming agent turn ────────────────────────────────────────────────
-def _run_turn(session: dict, user_text: str, emit):
+def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = None):
     """Run one agent turn, pushing SSE events through `emit(dict)`.
 
     Emits events: token, tool, status, done, error.
@@ -212,16 +353,20 @@ def _run_turn(session: dict, user_text: str, emit):
         "recursion_limit": agents._cfg.get("recursion_limit", 1000),
     }
 
+    # Fold any drag-and-dropped files into the user message: images become
+    # multimodal blocks, text/PDF files are extracted and embedded inline.
+    content = _build_user_content(user_text, attachments)
+
     if not session.get("started"):
         payload = {
-            "messages": [{"role": "user", "content": user_text}],
+            "messages": [{"role": "user", "content": content}],
             "project_path": session["path"],
             "language": session["language"],
             "model": session["model"],
         }
         session["started"] = True
     else:
-        payload = {"messages": [{"role": "user", "content": user_text}]}
+        payload = {"messages": [{"role": "user", "content": content}]}
 
     # Sent every turn so toggling tools mid-session takes effect immediately.
     # The tool-gate middleware restricts the model to exactly these names.
@@ -305,7 +450,8 @@ def _run_turn(session: dict, user_text: str, emit):
         ts = _now_iso()
         session["messages"].append(
             {"role": "user", "content": user_text, "ts": session.get(
-                "_pending_user_ts", ts)}
+                "_pending_user_ts", ts),
+             "attachments": _attachment_meta(attachments)}
         )
         session["messages"].append(
             {"role": "assistant", "content": answer, "ts": ts,
@@ -514,11 +660,14 @@ class Handler(BaseHTTPRequestHandler):
         data = self._read_body()
         sid = data.get("session_id")
         message = (data.get("message") or "").strip()
+        attachments = data.get("attachments")
+        if not isinstance(attachments, list):
+            attachments = []
         session = _sessions.get(sid)
         if not session:
             self._send_json({"error": "unknown session"}, 404)
             return
-        if not message:
+        if not message and not attachments:
             self._send_json({"error": "empty message"}, 400)
             return
 
@@ -553,7 +702,7 @@ class Handler(BaseHTTPRequestHandler):
         hb = threading.Thread(target=heartbeat, daemon=True)
         hb.start()
         try:
-            _run_turn(session, message, emit)
+            _run_turn(session, message, emit, attachments)
         finally:
             stop.set()
 
