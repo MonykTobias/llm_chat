@@ -1,0 +1,65 @@
+{
+  "tools": [
+    {
+      "name": "run_linter",
+      "description": "Run the appropriate linter for the detected language",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Project path to lint"
+          }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "run_tests",
+      "description": "Execute the test suite and capture coverage",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "include_coverage": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "run_type_check",
+      "description": "Run type checking / static type analysis",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "analyze_architecture",
+      "description": "Analyze code structure, imports, dependencies",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "depth": {
+            "type": "integer",
+            "default": 3
+          }
+        },
+        "required": ["path"]
+      }
+    }
+  ]
+}

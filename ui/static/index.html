@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Code Review Agent</title>
+  <!-- Prevent theme flash before JS loads -->
+  <script>
+    if (localStorage.getItem('theme') === 'light') document.documentElement.classList.remove('dark');
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' }</script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="bg-gray-50 dark:bg-slate-950 text-gray-900 dark:text-slate-100 font-sans antialiased">
+  <div id="app" class="flex h-screen overflow-hidden">
+
+    <!-- ── Left Sidebar ───────────────────────────────────────────── -->
+    <aside id="sidebar" class="w-72 flex-shrink-0 flex flex-col bg-white dark:bg-slate-900 border-r border-gray-200 dark:border-slate-700/60 overflow-hidden">
+
+      <!-- Brand -->
+      <div class="flex items-center gap-2.5 px-4 pt-5 pb-4 flex-shrink-0">
+        <span class="w-3 h-3 rounded-full bg-emerald-400 shadow-[0_0_10px_#34d399]"></span>
+        <h1 class="text-[15px] font-bold tracking-tight">Code Review</h1>
+      </div>
+
+      <!-- New Session form -->
+      <div class="px-4 flex-shrink-0">
+        <h2 class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500 mb-3">New session</h2>
+
+        <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Project path</label>
+        <div class="flex gap-1.5 mb-3">
+          <input id="path-input" type="text" placeholder="C:\path\to\project"
+            class="flex-1 min-w-0 px-2.5 py-2 text-sm rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 placeholder-gray-400 dark:placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors" />
+          <button id="browse-btn" title="Browse with File Explorer"
+            class="px-3 py-2 rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-300 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors">
+            📁
+          </button>
+        </div>
+
+        <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Language</label>
+        <select id="language-select"
+          class="w-full px-2.5 py-2 text-sm rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 mb-3">
+        </select>
+
+        <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Model</label>
+        <select id="model-select"
+          class="w-full px-2.5 py-2 text-sm rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 mb-3">
+        </select>
+
+        <button id="start-btn"
+          class="w-full py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+          Start review
+        </button>
+        <p id="new-session-error" class="text-red-400 text-xs mt-2 min-h-4"></p>
+      </div>
+
+      <!-- Session List -->
+      <div class="flex-1 min-h-0 flex flex-col px-4 pb-4 mt-3">
+        <h2 class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500 mb-2.5 flex-shrink-0">Sessions</h2>
+        <ul id="session-list" class="flex flex-col gap-1.5 overflow-y-auto flex-1"></ul>
+      </div>
+    </aside>
+
+    <!-- ── Chat Pane ───────────────────────────────────────────────── -->
+    <main id="chat-pane" class="flex-1 flex flex-col min-w-0">
+
+      <!-- Header -->
+      <header id="chat-header" class="flex items-center gap-2.5 px-4 py-3 bg-white dark:bg-slate-900 border-b border-gray-200 dark:border-slate-700/60 flex-shrink-0">
+        <button id="toggle-sidebar" title="Show / hide the sessions panel"
+          class="icon-btn flex-none w-8 h-8 flex items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-400 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-sm">
+          ☰
+        </button>
+        <div class="flex-1 min-w-0">
+          <h2 id="chat-title" class="text-sm font-semibold truncate">No session selected</h2>
+          <p id="chat-subtitle" class="text-xs text-gray-500 dark:text-slate-400 truncate mt-0.5">Create a session on the left to begin.</p>
+        </div>
+        <span id="restored-badge" class="hidden text-xs px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800 whitespace-nowrap font-medium">
+          restored
+        </span>
+        <select id="model-switch" class="hidden text-xs bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-800 dark:text-slate-100 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500"></select>
+        <button id="theme-toggle" title="Toggle light / dark mode"
+          class="icon-btn flex-none w-8 h-8 flex items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-400 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-sm">
+          🌙
+        </button>
+        <button id="toggle-stats" title="Show / hide the live stats panel"
+          class="icon-btn flex-none w-8 h-8 flex items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-400 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-sm">
+          📊
+        </button>
+      </header>
+
+      <!-- Messages -->
+      <div id="messages" class="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4"></div>
+
+      <!-- Composer -->
+      <div id="composer" class="border-t border-gray-200 dark:border-slate-700/60 px-4 py-3 bg-white dark:bg-slate-900 flex-shrink-0">
+        <div id="queue-indicator" class="hidden text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900/60 rounded-lg px-3 py-2 mb-2.5"></div>
+        <div class="flex gap-2.5 items-end">
+          <textarea id="message-input" rows="1" placeholder="Ask a follow-up question…"
+            class="flex-1 resize-none max-h-40 px-3 py-2.5 rounded-xl border border-gray-200 dark:border-slate-700 bg-gray-100 dark:bg-slate-800 text-gray-900 dark:text-slate-100 placeholder-gray-400 dark:placeholder-slate-500 text-sm font-[inherit] leading-relaxed focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"></textarea>
+          <button id="send-btn"
+            class="flex-none px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+            Send
+          </button>
+        </div>
+        <p class="text-xs text-gray-400 dark:text-slate-500 mt-2">Enter to send · Shift+Enter for newline · follow-ups queue while the agent is working</p>
+      </div>
+    </main>
+
+    <!-- ── Stats Pane ──────────────────────────────────────────────── -->
+    <aside id="stats-pane" class="w-72 flex-shrink-0 flex flex-col gap-3 p-4 bg-white dark:bg-slate-900 border-l border-gray-200 dark:border-slate-700/60 overflow-y-auto">
+
+      <h2 class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500">Live stats</h2>
+
+      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Status</div>
+        <div id="stat-status" class="stat-status idle font-semibold text-sm">Idle</div>
+      </div>
+
+      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Response time</div>
+        <div id="stat-timer" class="text-3xl font-bold tabular-nums leading-none">0.0s</div>
+        <div id="stat-timer-sub" class="text-xs text-gray-400 dark:text-slate-500 mt-1.5">last turn: —</div>
+      </div>
+
+      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Speed</div>
+        <div id="stat-speed" class="text-3xl font-bold tabular-nums leading-none">— <span class="unit">tok/s</span></div>
+        <div id="stat-speed-sub" class="text-xs text-gray-400 dark:text-slate-500 mt-1.5">output tokens / sec</div>
+      </div>
+
+      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Context window usage</div>
+        <div class="h-2 bg-gray-200 dark:bg-slate-900/80 rounded-full overflow-hidden border border-gray-300 dark:border-slate-700 mt-2 mb-1.5">
+          <div id="ctx-bar" class="h-full w-0 bg-gradient-to-r from-emerald-500 to-amber-400 transition-all duration-300 rounded-full"></div>
+        </div>
+        <div id="ctx-text" class="text-xs text-gray-400 dark:text-slate-500">— / —</div>
+      </div>
+
+      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-2">Last turn tokens</div>
+        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Input</span><b id="tok-in" class="tabular-nums">0</b></div>
+        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Output</span><b id="tok-out" class="tabular-nums">0</b></div>
+        <div class="flex justify-between text-sm py-0.5 border-t border-gray-200 dark:border-slate-700/50 mt-1 pt-1.5"><span class="text-gray-500 dark:text-slate-400">Total</span><b id="tok-total" class="tabular-nums">0</b></div>
+      </div>
+
+      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-2">Session totals</div>
+        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Turns</span><b id="tot-turns" class="tabular-nums">0</b></div>
+        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Input</span><b id="tot-in" class="tabular-nums">0</b></div>
+        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Output</span><b id="tot-out" class="tabular-nums">0</b></div>
+        <div class="flex justify-between text-sm py-0.5 border-t border-gray-200 dark:border-slate-700/50 mt-1 pt-1.5"><span class="text-gray-500 dark:text-slate-400">Total</span><b id="tot-total" class="tabular-nums">0</b></div>
+      </div>
+
+      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
+        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-2">Tool activity</div>
+        <ul id="tool-activity" class="flex flex-col gap-1 text-xs max-h-40 overflow-y-auto">
+          <li class="muted text-gray-400 dark:text-slate-500">none yet</li>
+        </ul>
+      </div>
+    </aside>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
