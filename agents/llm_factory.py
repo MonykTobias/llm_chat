@@ -38,6 +38,18 @@ def make_llm(cfg: dict) -> ChatOllama:
     )
     # Only send `reasoning` for models that support thinking; passing it to a
     # non-thinking model would push an unsupported `think` flag to Ollama.
-    if cfg.get("thinking"):
-        kwargs["reasoning"] = True
+    if thinking := cfg.get("thinking"):
+        if cfg.get("thinking_levels"):
+            # GPT-OSS style: low/medium/high
+            kwargs["reasoning"] = thinking if isinstance(thinking, str) else "medium"
+        else:
+            # Qwen / binary models: just on/off
+            kwargs["reasoning"] = True
     return ChatOllama(**kwargs)
+
+
+def make_system_prompt(base_prompt: str, cfg: dict) -> str:
+    """Prepend <|think|> for models that use prompt-based thinking (e.g. Gemma 4)."""
+    if cfg.get("thinking_token"):
+        return "<|think|>\n" + base_prompt
+    return base_prompt

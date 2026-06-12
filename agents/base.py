@@ -31,6 +31,13 @@ from agents.llm_factory import make_llm
 from structured_output import ReviewState
 
 
+def _msg_field(message: Any, field: str) -> Any:
+    """Read `field` from a LangChain message object or a plain-dict message."""
+    if isinstance(message, dict):
+        return message.get(field)
+    return getattr(message, field, None)
+
+
 class BaseAgent(ABC):
     """A pool of model-variants for one kind of agent.
 
@@ -46,6 +53,19 @@ class BaseAgent(ABC):
 
     #: First user message sent by `run_session` to kick a session off.
     kickoff_message: str = "Hello."
+
+    #: Whether this agent needs a project directory to do its job. True for every
+    #: code-oriented role (they read/write files under `state["project_path"]`);
+    #: a chat-only role sets this False so the UI can offer it without a folder
+    #: and keep it permanently separate from the folder-requiring roles.
+    requires_project: bool = True
+
+    #: Per-turn cap on how many times a given tool may run before it is dropped
+    #: from the set advertised to the model. This is the hard loop-breaker: small
+    #: local models often re-call a tool forever (e.g. web_browse on the same
+    #: query); once the cap is hit the tool disappears from their options, so they
+    #: must answer instead of looping. Tools absent from this map are uncapped.
+    tool_call_budgets: dict[str, int] = {"web_browse": 10}
 
     def __init__(
         self,
@@ -74,12 +94,16 @@ class BaseAgent(ABC):
         #    registered, so the tool node can still execute the allowed ones).
         prompt_middleware = self._build_prompt_middleware()
         tool_gate_middleware = self._build_tool_gate_middleware()
+        tool_budget_middleware = self._build_tool_budget_middleware()
+
+        self._model_configs = model_configs
 
         self._pool: dict[str, Any] = {
             model_name: create_agent(
                 model=make_llm(model_cfg),
                 tools=self.tools,
-                middleware=[prompt_middleware, tool_gate_middleware],
+                middleware=[prompt_middleware, tool_gate_middleware,
+                            tool_budget_middleware],
                 state_schema=self.state_schema,
                 checkpointer=checkpointer,
             )
@@ -100,7 +124,7 @@ class BaseAgent(ABC):
         """Tools this agent may call. Must be ready before `__init__` runs."""
 
     @abstractmethod
-    def render_prompt(self, request) -> str:
+    def render_prompt(self, request, cfg: dict = {}) -> str:
         """Build the system prompt for one run from `request.state`."""
 
     @property
@@ -186,8 +210,10 @@ class BaseAgent(ABC):
 
         @dynamic_prompt
         def _prompt(request) -> str:
-            return self.render_prompt(request)
-
+            # resolve active model for this request
+            model_name = request.state.get("model_name") or self._default_name
+            cfg = self._model_configs.get(model_name, {})
+            return self.render_prompt(request, cfg)
         return _prompt
 
     def _build_tool_gate_middleware(self):
@@ -208,3 +234,41 @@ class BaseAgent(ABC):
             return handler(request)
 
         return _gate
+
+    def _build_tool_budget_middleware(self):
+        """Hard loop-breaker: drop a tool once it has run too many times this turn.
+
+        Counts how often each tool has already returned *since the last user
+        message* (so the budget resets every turn) and removes any tool that has
+        hit its `tool_call_budgets` cap from the tools advertised to the model.
+        A model stuck re-calling `web_browse` then simply loses the option and is
+        forced to answer with what it has, instead of looping to the recursion
+        limit. Tools not listed in `tool_call_budgets` are never capped.
+        """
+
+        @wrap_model_call
+        def _budget(request, handler):
+            budgets = self.tool_call_budgets or {}
+            if budgets:
+                messages = request.state.get("messages", []) or []
+                # Scope to the current turn: only count tool results that came
+                # after the most recent human message.
+                start = 0
+                for i, m in enumerate(messages):
+                    if _msg_field(m, "type") == "human":
+                        start = i
+                counts: dict[str, int] = {}
+                for m in messages[start:]:
+                    if _msg_field(m, "type") == "tool":
+                        name = _msg_field(m, "name")
+                        if name:
+                            counts[name] = counts.get(name, 0) + 1
+                exhausted = {n for n, cap in budgets.items()
+                             if counts.get(n, 0) >= cap}
+                if exhausted:
+                    request = request.override(
+                        tools=[t for t in request.tools if t.name not in exhausted]
+                    )
+            return handler(request)
+
+        return _budget

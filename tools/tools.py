@@ -8,6 +8,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -438,6 +439,22 @@ _WEB_TIMEOUT = 20
 _WEB_MAX_BYTES = 2_000_000   # hard cap on bytes read from any single response
 _WEB_MAX_CHARS = 4_000       # cap on characters returned to the model
 
+# ── loop-breaker + result cache ──────────────────────────────────────────
+# Local ReAct models tend to call web_browse with the same query/url over and
+# over (especially when DuckDuckGo rate-limits and returns "no results"). Two
+# defenses, both server-lifetime, both thread-safe:
+#   * _WEB_CACHE  — identical calls return the identical earlier result instead
+#     of hitting the network again, so repeats are free and don't get throttled.
+#   * _WEB_RECENT — a rolling window of recent call signatures. Once the SAME
+#     signature shows up _WEB_LOOP_THRESHOLD times in that window we stop running
+#     it and hand the model a firm "you already did this, move on" instead. The
+#     window naturally forgets across runs, so a later run repeating an old query
+#     starts with a clean slate.
+_WEB_CACHE: dict[str, str] = {}
+_WEB_RECENT: "deque[str]" = deque(maxlen=16)
+_WEB_LOOP_LOCK = threading.RLock()
+_WEB_LOOP_THRESHOLD = 3      # identical calls within the window before we cut it off
+
 
 def _web_http(target: str, data: "bytes | None" = None) -> "tuple[int, str, str]":
     """GET, or POST when `data` is given. Returns (status, content_type, text)."""
@@ -535,14 +552,49 @@ def _web_ddg_search(query: str, limit: int) -> list:
     return []
 
 
+def _web_signature(url: "str | None", query: "str | None", limit: int) -> str:
+    """Stable key for a call, so identical searches/fetches collapse together."""
+    if query is not None:
+        return f"search::{' '.join(query.lower().split())}::{limit}"
+    return f"fetch::{(url or '').strip().rstrip('/').lower()}"
+
+
 def _web_browse(url: "str | None" = None, query: "str | None" = None,
                 max_results: int = 5) -> str:
-    """Search the web (query) or fetch a single page (url). Exactly one."""
+    """Search/fetch with a loop-breaker and result cache wrapped around it."""
     if (query is None) == (url is None):
         return "[error] Provide exactly one of `query` or `url`."
 
     limit = max(1, min(max_results, 10))
+    sig = _web_signature(url, query, limit)
 
+    with _WEB_LOOP_LOCK:
+        repeats = _WEB_RECENT.count(sig)
+        _WEB_RECENT.append(sig)
+        cached = _WEB_CACHE.get(sig)
+
+    # Same call seen too many times in a row -> stop looping, tell the model so.
+    if repeats >= _WEB_LOOP_THRESHOLD - 1:
+        what = f"search for `{query}`" if query is not None else f"fetch of `{url}`"
+        return (
+            f"[stop] You have already run this exact {what} {repeats + 1} times this "
+            "session and the result has not changed — it will not change if you try "
+            "again. Do NOT call web_browse with this query/url again. Use the result "
+            "you already have (scroll up), or proceed with what you know. If you truly "
+            "need more, search a DIFFERENT query or fetch a DIFFERENT url."
+        )
+
+    if cached is not None:
+        return cached
+
+    result = _web_fetch_or_search(url, query, limit)
+    with _WEB_LOOP_LOCK:
+        _WEB_CACHE[sig] = result
+    return result
+
+
+def _web_fetch_or_search(url: "str | None", query: "str | None", limit: int) -> str:
+    """Search the web (query) or fetch a single page (url). Exactly one."""
     # ── Search ──────────────────────────────────────────────────────────
     if query is not None:
         try:

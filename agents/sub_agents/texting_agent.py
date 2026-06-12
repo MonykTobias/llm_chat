@@ -4,12 +4,19 @@ from string import Template
 from typing import Any, List
 
 from agents.base import BaseAgent
-from tools.tools import list_all_files, web_browse
+from agents.llm_factory import make_system_prompt
+from tools.tools import web_browse
 
-DEFAULT_REVIEW_TOOLS = [web_browse,list_all_files]
+# Chat mode is folder-less, so it gets web search only — no file tools, which
+# would need a project_path this role never has.
+DEFAULT_REVIEW_TOOLS = [web_browse]
 
 class TextingAgent(BaseAgent):
-    """A conversational text assistant with no tools — pure chat mode."""
+    """A conversational chat assistant — web search only, no project folder."""
+
+    # Folder-less: the UI offers this role without a directory and keeps it
+    # permanently separate from the code-oriented (project) roles.
+    requires_project = False
 
     kickoff_message = "Hi! I'm your friendly chat companion. Ask me anything or just say hello!"
 
@@ -39,11 +46,12 @@ class TextingAgent(BaseAgent):
     def tools(self) -> List:  # type: ignore[return-type]
         return self._tools
 
-    def render_prompt(self, request) -> str:
+    def render_prompt(self, request, cfg: dict = {}) -> str:
         """System prompt rebuilt per run, with project language and path filled in."""
         language = request.state.get("language", "unknown")
         project_path = request.state.get("project_path", ".")
-        return Template(self._prompt_template).safe_substitute(
+        base = Template(self._prompt_template).safe_substitute(
             language=language,
             project_path=project_path,
         )
+        return make_system_prompt(base,cfg)

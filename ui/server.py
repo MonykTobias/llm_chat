@@ -75,9 +75,22 @@ print(ROLES)
 # disable any of them per session (applied to the next message).
 TOOLS_BY_ROLE = agents.TOOLS_BY_ROLE
 
+# Whether each role needs a project folder. Drives the Chat/Project split: a chat
+# session may only select/switch to roles where this is False, a project session
+# only to roles where it is True.
+ROLE_REQUIRES_PROJECT = agents.ROLE_REQUIRES_PROJECT
+
+# Roles offered as the default for each mode (first matching role in config order).
+_DEFAULT_CHAT_ROLE = next((r for r in ROLES if not ROLE_REQUIRES_PROJECT.get(r, True)), None)
+
 
 def _tools_for_role(role: str) -> list[str]:
     return list(TOOLS_BY_ROLE.get(role, TOOLS_BY_ROLE.get(DEFAULT_ROLE, [])))
+
+
+def _mode_for_role(role: str) -> str:
+    """'project' if the role needs a folder, else 'chat'."""
+    return "project" if ROLE_REQUIRES_PROJECT.get(role, True) else "chat"
 
 # ── session store (in-memory, mirrored to disk for re-reading) ──────────────
 # The agent's own InMemorySaver keeps the LangGraph state per thread_id while
@@ -85,6 +98,14 @@ def _tools_for_role(role: str) -> list[str]:
 # re-read in the UI (and survive a restart, read-only).
 _sessions: dict[str, dict] = {}
 _store_lock = threading.Lock()
+
+# ── stop/cancel registry ────────────────────────────────────────────────────
+# One threading.Event per session that currently has a turn streaming. The Stop
+# button POSTs to /api/chat/stop, which sets the event; the stream loop in
+# _run_turn checks it each chunk and breaks. agent.stream() is pull-based, so
+# once we stop pulling the graph stops advancing — no further LLM/tool steps run.
+_cancels: dict[str, threading.Event] = {}
+_cancels_lock = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -100,6 +121,8 @@ def _load_sessions() -> None:
                 # Back-fill fields added after this session was first saved.
                 s.setdefault("role", DEFAULT_ROLE)
                 s.setdefault("enabled_tools", _tools_for_role(s["role"]))
+                # Sessions saved before chat mode all had folders -> project.
+                s.setdefault("mode", _mode_for_role(s.get("role", DEFAULT_ROLE)))
                 # If the SQLite checkpointer has state for this thread the session
                 # is fully resumable; otherwise the next message re-initialises it.
                 cfg = {"configurable": {"thread_id": s["id"]}}
@@ -120,9 +143,11 @@ def _save_sessions() -> None:
         tmp.replace(SESSIONS_FILE)
 
 
-def _new_session(path: str, language: str, model: str, role: str) -> dict:
+def _new_session(path: str, language: str, model: str, role: str,
+                 mode: str = "project") -> dict:
     sid = uuid.uuid4().hex[:12]
-    title = Path(path).name or path or "session"
+    # Chat sessions have no folder, so fall back to a friendly default title.
+    title = Path(path).name or path or ("Chat" if mode == "chat" else "session")
     session = {
         "id": sid,
         "title": title,
@@ -130,6 +155,7 @@ def _new_session(path: str, language: str, model: str, role: str) -> dict:
         "language": language,
         "model": model,
         "role": role,
+        "mode": mode,            # 'chat' (folder-less) or 'project'
         "enabled_tools": _tools_for_role(role),  # all on by default
         "created": _now_iso(),
         "messages": [],          # [{role, content, ts, usage?, elapsed?}]
@@ -343,11 +369,15 @@ def _attachment_meta(attachments: "list | None") -> list[dict]:
 
 
 # ── the streaming agent turn ────────────────────────────────────────────────
-def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = None):
+def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = None,
+              cancel: "threading.Event | None" = None):
     """Run one agent turn, pushing SSE events through `emit(dict)`.
 
-    Emits events: token, tool, status, done, error.
+    Emits events: token, tool, status, done, error. If `cancel` is set partway
+    through, the stream is stopped and whatever was produced so far is saved and
+    returned as a (stopped) `done` event.
     """
+    cancel = cancel or threading.Event()
     config = {
         "configurable": {"thread_id": session["id"]},
         "recursion_limit": agents._cfg.get("recursion_limit", 1000),
@@ -376,6 +406,16 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
 
     started = time.monotonic()
     answer_parts: list[str] = []
+    # Ordered record of the turn so the UI can interleave text and tool bubbles
+    # in stream order (and re-render that layout when the session is reopened).
+    parts: list[dict] = []      # [{type:"text",content} | {type:"tool",name,target}]
+    cur_text: list[str] = []    # buffer for the current (open) text segment
+
+    def flush_text() -> None:
+        if cur_text:
+            parts.append({"type": "text", "content": "".join(cur_text)})
+            cur_text.clear()
+
     last_usage: dict | None = None
     active_tools: set[str] = set()
     # Accumulate streamed tool-call args (they arrive as JSON fragments) so we
@@ -384,11 +424,19 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
     tool_index_by_id: dict[str, int] = {}  # tool_call id  -> index
     tool_index_by_name: dict[str, int] = {}  # tool name    -> latest index
 
+    stopped = False
     try:
         agent = agents.graph_for(session.get("role"), session.get("model"))
-        for chunk, _meta in agent.stream(
-            payload, config=config, stream_mode="messages"
-        ):
+        # Keep a handle on the generator so we can close() it promptly on cancel,
+        # which sends GeneratorExit into the graph and stops it advancing.
+        stream = agent.stream(payload, config=config, stream_mode="messages")
+        for chunk, _meta in stream:
+            # User hit Stop: quit pulling, close the generator, keep partial work.
+            if cancel.is_set():
+                stopped = True
+                stream.close()
+                break
+
             # Tool result coming back
             if isinstance(chunk, ToolMessage):
                 name = chunk.name or "tool"
@@ -397,6 +445,10 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                 if idx is None:
                     idx = tool_index_by_name.get(name)
                 target = _extract_target(tool_args.get(idx, "")) if idx is not None else None
+                # Close any text streamed before this tool into its own segment,
+                # then record the tool so parts read in true chronological order.
+                flush_text()
+                parts.append({"type": "tool", "name": name, "target": target})
                 emit({"type": "tool", "name": name, "phase": "end", "target": target})
                 continue
 
@@ -420,6 +472,8 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                         tool_index_by_name[name] = idx
                         if name not in active_tools:
                             active_tools.add(name)
+                            # Text before the tool call ends its segment here.
+                            flush_text()
                             emit({"type": "tool", "name": name, "phase": "start"})
 
                 # Streamed answer text
@@ -431,12 +485,14 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                     )
                 if text:
                     answer_parts.append(text)
+                    cur_text.append(text)
                     emit({"type": "token", "text": text})
 
                 # Token accounting (Ollama fills this on the final chunk)
                 if getattr(chunk, "usage_metadata", None):
                     last_usage = chunk.usage_metadata
 
+        flush_text()  # trailing text segment after the last tool (or whole answer)
         elapsed = round(time.monotonic() - started, 2)
         answer = "".join(answer_parts).strip()
 
@@ -455,7 +511,7 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
         )
         session["messages"].append(
             {"role": "assistant", "content": answer, "ts": ts,
-             "usage": usage, "elapsed": elapsed}
+             "usage": usage, "elapsed": elapsed, "parts": parts}
         )
         session["last"] = {**usage, "elapsed": elapsed}
         t = session["totals"]
@@ -468,6 +524,8 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
         emit({
             "type": "done",
             "answer": answer,
+            "parts": parts,
+            "stopped": stopped,
             "usage": usage,
             "elapsed": elapsed,
             "totals": session["totals"],
@@ -540,6 +598,7 @@ class Handler(BaseHTTPRequestHandler):
                 "models": MODELS,
                 "roles": ROLES,
                 "tools_by_role": TOOLS_BY_ROLE,
+                "role_modes": {r: _mode_for_role(r) for r in ROLES},
             })
         else:
             self._send_json({"error": "not found"}, 404)
@@ -551,11 +610,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"path": path})
         elif route == "/api/session":
             data = self._read_body()
+            mode = (data.get("mode") or "project").strip().lower()
+            if mode not in ("project", "chat"):
+                self._send_json({"error": f"unknown mode '{mode}'"}, 400)
+                return
             path = (data.get("path") or "").strip()
             language = (data.get("language") or "").strip().lower()
             model = (data.get("model") or "").strip().lower()
-            role = (data.get("role") or DEFAULT_ROLE).strip()
-            if not path:
+            role = (data.get("role")
+                    or (_DEFAULT_CHAT_ROLE if mode == "chat" else DEFAULT_ROLE)
+                    or DEFAULT_ROLE).strip()
+            # Chat sessions are folder-less and default to English; project
+            # sessions still require a real path + language.
+            if mode == "chat":
+                path = ""
+                language = language or "english"
+            elif not path:
                 self._send_json({"error": "path is required"}, 400)
                 return
             if language not in LANGUAGES:
@@ -567,7 +637,11 @@ class Handler(BaseHTTPRequestHandler):
             if role not in ROLES:
                 self._send_json({"error": f"unknown role '{role}'"}, 400)
                 return
-            session = _new_session(path, language, model, role)
+            if _mode_for_role(role) != mode:
+                self._send_json(
+                    {"error": f"role '{role}' is not available in {mode} mode"}, 400)
+                return
+            session = _new_session(path, language, model, role, mode)
             self._send_json({"session": session})
         elif route == "/api/session/model":
             data = self._read_body()
@@ -593,6 +667,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if new_role not in ROLES:
                 self._send_json({"error": f"unknown role '{new_role}'"}, 400)
+                return
+            # Session type is fixed at creation: a chat session can only switch
+            # among chat roles, a project session only among project roles. This
+            # is what keeps a folder-less chat from ever reaching a file tool.
+            session_mode = session.get("mode", _mode_for_role(session.get("role", DEFAULT_ROLE)))
+            if _mode_for_role(new_role) != session_mode:
+                self._send_json(
+                    {"error": f"role '{new_role}' is not available in "
+                              f"{session_mode} mode"}, 400)
                 return
             # Same thread_id -> the next turn keeps the full history but is
             # handled by the new role's prompt (and tools). Roles can expose
@@ -652,6 +735,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "unknown session"}, 404)
         elif route == "/api/chat":
             self._handle_chat()
+        elif route == "/api/chat/stop":
+            data = self._read_body()
+            sid = data.get("session_id")
+            with _cancels_lock:
+                ev = _cancels.get(sid)
+            if ev is not None:
+                ev.set()
+                self._send_json({"ok": True})
+            else:
+                self._send_json({"ok": False, "error": "no active turn"}, 404)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -701,10 +794,18 @@ class Handler(BaseHTTPRequestHandler):
 
         hb = threading.Thread(target=heartbeat, daemon=True)
         hb.start()
+
+        # Register a cancel flag the Stop button can trip for this session.
+        cancel = threading.Event()
+        with _cancels_lock:
+            _cancels[sid] = cancel
         try:
-            _run_turn(session, message, emit, attachments)
+            _run_turn(session, message, emit, attachments, cancel)
         finally:
             stop.set()
+            with _cancels_lock:
+                if _cancels.get(sid) is cancel:
+                    del _cancels[sid]
 
 
 class _Server(ThreadingHTTPServer):

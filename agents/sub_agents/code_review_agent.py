@@ -13,6 +13,7 @@ from string import Template
 from typing import Any
 
 from agents.base import BaseAgent
+from agents.llm_factory import make_system_prompt
 from tools.tools import (
     analyze_architecture,
     list_all_files,
@@ -70,11 +71,12 @@ class CodeReviewAgent(BaseAgent):
     def tools(self) -> list:
         return self._tools
 
-    def render_prompt(self, request) -> str:
+    def render_prompt(self, request, cfg: dict = {}) -> str:
         """System prompt rebuilt per run, with project language and path filled in."""
         language = request.state.get("language", "unknown")
         project_path = request.state.get("project_path", ".")
-        return Template(self._prompt_template).safe_substitute(
+        base = Template(self._prompt_template).safe_substitute(
             language=language,
             project_path=project_path,
         )
+        return make_system_prompt(base,cfg)

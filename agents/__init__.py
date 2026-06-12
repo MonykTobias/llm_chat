@@ -42,6 +42,7 @@ __all__ = [
     "ROLES",
     "DEFAULT_ROLE",
     "TOOLS_BY_ROLE",
+    "ROLE_REQUIRES_PROJECT",
     "graph_for",
     "review_agent",
     "review_session",
@@ -101,6 +102,11 @@ ROLES = list(AGENTS)
 # Tools each role can run — the UI renders a checkbox per name and sends back
 # the enabled subset per turn (see BaseAgent's tool gate).
 TOOLS_BY_ROLE: dict[str, list[str]] = {role: agent.tool_names for role, agent in AGENTS.items()}
+
+# Whether each role needs a project folder. The UI uses this to split roles into
+# "project" (True) and "chat" (False) modes and to gate which roles a session may
+# select or switch to. See BaseAgent.requires_project.
+ROLE_REQUIRES_PROJECT: dict[str, bool] = {role: agent.requires_project for role, agent in AGENTS.items()}
 
 # The default role's agent — convenient handle and backward-compat fallback.
 review_agent = AGENTS[DEFAULT_ROLE]

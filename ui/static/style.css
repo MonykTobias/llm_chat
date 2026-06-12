@@ -10,6 +10,21 @@
 }
 @keyframes blink { 50% { opacity: 0; } }
 
+/* ── Typing / loading indicator ──────────────────────────────────── */
+/* Shown while the turn is active but no text bubble is streaming yet
+   (before the first token, and across tool calls) — the "model is working"
+   signal the per-bubble ▋ cursor can't cover. */
+.typing-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  margin: 0 2px;
+  border-radius: 9999px;
+  background: #60a5fa;
+  animation: blink 1.2s steps(2) infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
 /* ── Scrollbar ───────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -32,6 +47,14 @@
   border-color: #3b82f6 !important;
   color: #3b82f6 !important;
   background-color: rgba(59, 130, 246, 0.1) !important;
+}
+
+/* ── New-session mode toggle (Project / Chat) ────────────────────── */
+.mode-btn { color: #64748b; }
+.dark .mode-btn { color: #94a3b8; }
+.mode-btn.active {
+  background-color: #2563eb;
+  color: #fff;
 }
 
 /* ── tok/s unit label ────────────────────────────────────────────── */

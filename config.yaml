@@ -37,6 +37,15 @@ agents:
     max_tokens: 8192
     thinking: true
 
+  qwen3.6_35b-a3b:
+    model: "qwen3.6:35b-a3b"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 262144
+    max_tokens: 8192
+    thinking: true
+
   qwen3_32b:
     model: "qwen3:32b"
     base_url: "http://localhost:11434/v1"
@@ -45,6 +54,46 @@ agents:
     context_window: 262144
     max_tokens: 8192
     thinking: true
+
+  gpt-oss:20b-low:
+    model: "gpt-oss:20b"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 131072
+    max_tokens: 8192
+    thinking: true
+    thinking_levels: low
+
+  gpt-oss:20b-medium:
+    model: "gpt-oss:20b"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 131072
+    max_tokens: 8192
+    thinking: true
+    thinking_levels: medium
+
+  gpt-oss:20b-high:
+    model: "gpt-oss:20b"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 131072
+    max_tokens: 8192
+    thinking: true
+    thinking_levels: high
+
+  gemma4:26b:
+    model: "gemma4:26b"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 262144
+    max_tokens: 8192
+    thinking: true
+    thinking_token: true
 
   qwen3_14b:
     model: "qwen3:14b"
@@ -64,14 +113,14 @@ agents:
     max_tokens: 8192
     thinking: true
 
-  qwen3_14b_q8_0:
-    model: "qwen3:14b-q8_0"
+  mixtral:8x7b:
+    model: "mixtral:8x7b"
     base_url: "http://localhost:11434/v1"
     api_key: "ollama"
     temperature: 0.0
     context_window: 262144
     max_tokens: 8192
-    thinking: true
+    thinking: false
 
   deepseek-r1:14b:
     model: "deepseek-r1:14b"
@@ -312,6 +361,7 @@ prompt:
       knowledge — history, math, established concepts, definitions — answer those directly from what
       you know. When you do search, tell the person what you found and cite the source so they can
       follow up, and flag it openly when sources disagree.
+      Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
     </tools>
 
   cr_explore: |
@@ -345,6 +395,7 @@ prompt:
     - web_browse — use when the code leans on a library, framework, API, or error you don't fully
       recognize; look it up to understand what the code actually does. This is for understanding the
       existing code, not for finding solutions — that stays the plan and act stages' job.
+      Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
     Ground every single statement in something a tool actually returned.
     Read each file at most once per run — keep what you read in working memory and
     reuse it. Only re-read a file if you have written to it, or have a concrete reason
@@ -419,6 +470,7 @@ prompt:
     - web_browse — use to confirm anything external your plan will rely on: an API's current signature,
       a library's recommended usage, version-specific behavior, or whether an approach is still current
       best practice. Better to learn an option is wrong now than to have act discover it mid-edit.
+      Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
     Read each file at most once per run — keep what you read in working memory and
     reuse it. Only re-read a file if you have written to it, or have a concrete reason
     to believe it changed since you last read it.
@@ -487,6 +539,7 @@ prompt:
     - web_browse — use to confirm the exact, current signature or idiomatic usage of an external API
       or library you are about to call, so you write it correctly the first time. Don't research the
       approach here — that was the plan's job; only look up the details you need to implement it.
+      Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
     You do NOT have linters, type-checkers, or tests — verifying your work is the verify stage's job,
     by design. So write carefully, and hand off a precise list of what needs to be checked.
     Read each file at most once per run — keep what you read in working memory and
@@ -559,6 +612,7 @@ prompt:
     - web_browse — use when a call to an external API or library looks wrong, deprecated, or unsafe:
       check the current docs or advisories to judge whether the code uses it correctly. Confirm against
       the real source rather than your memory of how the library used to behave.
+      Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
     You have NO write access — you cannot fix problems, and you should not. A verifier that edits is
     marking its own homework. Report the problem; let act fix it.
     Read each file at most once per run — keep what you read in working memory and

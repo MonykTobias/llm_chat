@@ -8,6 +8,8 @@ const state = {
   models: [],
   roles: [],
   toolsByRole: {},
+  roleModes: {},         // role -> "chat" | "project"
+  createMode: "project", // which type the new-session form is building
   streaming: false,      // is an agent turn currently running?
   streamingId: null,     // tracks which session is streaming
   queue: [],             // follow-up messages waiting to be sent: {text, attachments}
@@ -78,9 +80,10 @@ async function refreshSessions() {
     state.models = data.models || [];
     state.roles = data.roles || [];
     state.toolsByRole = data.tools_by_role || {};
+    state.roleModes = data.role_modes || {};
     populateLanguages();
     populateModels();
-    populateRoles();
+    setCreateMode(state.createMode);  // also (re)populates the role dropdown
     renderSessionList();
     if (!state.activeId && state.sessions.length) {
       selectSession(state.sessions[state.sessions.length - 1].id);
@@ -112,24 +115,46 @@ function populateModels(){
   }
 }
 
-function populateRoles(){
+// Roles offered for a given mode (chat roles need no folder, project roles do).
+function rolesForMode(mode) {
+  return state.roles.filter((r) => (state.roleModes[r] || "project") === mode);
+}
+
+// Rebuild the new-session role dropdown for the active create mode.
+function populateRoles() {
   const sel = $("role-select");
-  if(sel.options.length) return; // only once
-  for (const role of state.roles){
+  sel.innerHTML = "";
+  for (const role of rolesForMode(state.createMode)) {
     const o = el("option", null, role);
     o.value = role;
     sel.appendChild(o);
   }
 }
 
+// Switch the new-session form between "project" and "chat": highlight the chosen
+// button, show/hide the folder + language fields, refilter roles, relabel Start.
+function setCreateMode(mode) {
+  state.createMode = mode;
+  for (const btn of document.querySelectorAll("#mode-toggle .mode-btn")) {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+  }
+  $("project-fields").classList.toggle("hidden", mode === "chat");
+  populateRoles();
+  $("start-btn").textContent = mode === "chat" ? "Start chat" : "Start review";
+}
+
 // ── UI bindings ────────────────────────────────────────────────────────
 function bindUI() {
   $("browse-btn").addEventListener("click", browseFolder);
+  for (const btn of document.querySelectorAll("#mode-toggle .mode-btn")) {
+    btn.addEventListener("click", () => setCreateMode(btn.dataset.mode));
+  }
   $("start-btn").addEventListener("click", startSession);
   $("toggle-sidebar").addEventListener("click", () => togglePanel("sidebar"));
   $("toggle-stats").addEventListener("click", () => togglePanel("stats"));
   $("theme-toggle").addEventListener("click", toggleTheme);
   $("send-btn").addEventListener("click", onSend);
+  $("stop-btn").addEventListener("click", onStop);
   $("model-switch").addEventListener("change", (e) => switchModel(e.target.value));
   $("role-switch").addEventListener("change", (e) => switchRole(e.target.value));
 
@@ -276,11 +301,13 @@ async function browseFolder() {
 
 // ── Create a new session ───────────────────────────────────────────────
 async function startSession() {
+  const mode = state.createMode;
+  const isChat = mode === "chat";
   const path = $("path-input").value.trim();
   const language = $("language-select").value;
   const errBox = $("new-session-error");
   errBox.textContent = "";
-  if (!path) { errBox.textContent = "Please choose a project path."; return; }
+  if (!isChat && !path) { errBox.textContent = "Please choose a project path."; return; }
 
   const btn = $("start-btn");
   btn.disabled = true;
@@ -289,7 +316,13 @@ async function startSession() {
     const res = await fetch("/api/session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, language, model: $("model-select").value, role: $("role-select").value }),
+      body: JSON.stringify({
+        mode,
+        path: isChat ? "" : path,
+        language,
+        model: $("model-select").value,
+        role: $("role-select").value,
+      }),
     });
     const data = await res.json();
     if (data.error) { errBox.textContent = data.error; return; }
@@ -297,13 +330,14 @@ async function startSession() {
     renderSessionList();
     selectSession(data.session.id);
     $("path-input").value = "";
-    sendMessage("Review this project.");
+    // Project sessions auto-kick off a review; chat sessions wait for the user.
+    if (!isChat) sendMessage("Review this project.");
   } catch (e) {
     errBox.textContent = "Could not start session.";
     console.error(e);
   } finally {
     btn.disabled = false;
-    btn.textContent = "Start review";
+    btn.textContent = isChat ? "Start chat" : "Start review";
   }
 }
 
@@ -321,7 +355,8 @@ function renderSessionList() {
 
     const info = el("div", "flex-1 min-w-0");
     info.appendChild(el("div", "text-sm font-semibold truncate", s.title));
-    const meta = `${s.language} · ${fmtTime(s.created)}`;
+    const label = (s.mode || "project") === "chat" ? "chat" : s.language;
+    const meta = `${label} · ${fmtTime(s.created)}`;
     info.appendChild(el("div", "text-[11px] text-gray-400 dark:text-slate-500 mt-0.5 truncate",
       meta + (s.restored ? " · restored" : "")));
     info.addEventListener("click", () => selectSession(s.id));
@@ -418,9 +453,12 @@ async function switchRole(newRole) {
   }
 }
 
-// One source of truth for the header subtitle: path · language · model · role.
+// One source of truth for the header subtitle. Chat sessions have no folder, so
+// they lead with "Chat" instead of a path/language.
 function subtitleFor(s) {
-  return `${s.path}  ·  ${s.language}  ·  ${s.model}` + (s.role ? `  ·  ${s.role}` : "");
+  const isChat = (s.mode || "project") === "chat";
+  const lead = isChat ? "Chat" : `${s.path}  ·  ${s.language}`;
+  return `${lead}  ·  ${s.model}` + (s.role ? `  ·  ${s.role}` : "");
 }
 
 // ── Tool toggles (per session, applied to the next message) ─────────────
@@ -502,9 +540,12 @@ function renderActive() {
     sw.appendChild(o);
   }
 
+  // Only roles of this session's own mode — a chat session can never switch to a
+  // folder-requiring role, and vice versa (type is fixed at creation).
   const rsw = $("role-switch");
   rsw.innerHTML = "";
-  for (const r of state.roles) {
+  const sessionMode = s.mode || (state.roleModes[s.role] || "project");
+  for (const r of rolesForMode(sessionMode)) {
     const o = el("option", null, r);
     o.value = r;
     if (r === s.role) o.selected = true;
@@ -520,7 +561,11 @@ function renderActive() {
   }
 
   for (const m of s.messages) {
-    addMessageBubble(m.role, m.content, m.ts, m);
+    if (m.role === "assistant" && Array.isArray(m.parts) && m.parts.length) {
+      renderAssistantTurn(m);
+    } else {
+      addMessageBubble(m.role, m.content, m.ts, m);
+    }
   }
 
   // ALLOW INPUT: only lock the composer when a *different* session is streaming
@@ -548,9 +593,66 @@ function updateComposerMode() {
     ? "Queue a follow-up… (sent when the agent finishes)"
     : "Ask a follow-up question…";
   $("send-btn").textContent = queueing ? "Queue" : "Send";
+
+  // Stop button: shown only while the *active* session is mid-turn, so it sits
+  // beside the Send/Queue button and lets the user abort the runaway agent.
+  const stopBtn = $("stop-btn");
+  if (queueing) {
+    stopBtn.classList.remove("hidden");
+    stopBtn.disabled = false;
+  } else {
+    stopBtn.classList.add("hidden");
+  }
+}
+
+// Ask the server to stop the in-flight turn for the active session. The stream
+// loop trips its cancel flag, ends the turn, and emits a (stopped) done event —
+// so the normal reader path tears everything down; we just disable the button.
+async function onStop() {
+  const s = activeSession();
+  if (!s || !(state.streaming && state.streamingId === s.id)) return;
+  $("stop-btn").disabled = true;
+  setStatus("working", "Stopping…");
+  try {
+    await fetch("/api/chat/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: s.id }),
+    });
+  } catch (e) {
+    console.error(e);
+  }
 }
 
 // ── Message rendering ──────────────────────────────────────────────────
+const AI_BUBBLE_CLS =
+  "ai-bubble px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-gray-100 dark:bg-slate-800 " +
+  "border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 " +
+  "text-sm leading-relaxed break-words";
+
+// The "time · 4.2s · 1,234 tok · 18.3 tok/s" line shown under an assistant turn.
+function bubbleMetaText(role, ts, meta) {
+  let metaText = fmtTime(ts);
+  if (role === "assistant" && meta && meta.elapsed != null) {
+    metaText += `  ·  ${meta.elapsed}s`;
+    if (meta.usage && meta.usage.total_tokens) metaText += `  ·  ${fmtNum(meta.usage.total_tokens)} tok`;
+    if (meta.usage && meta.usage.output_tokens && meta.elapsed) {
+      metaText += `  ·  ${(meta.usage.output_tokens / meta.elapsed).toFixed(1)} tok/s`;
+    }
+  }
+  return metaText;
+}
+
+// A standalone assistant text bubble appended to the chat, in its own wrap so it
+// reads as one segment among interleaved tool pills. Returns {wrap, bubble}.
+function makeAssistantBubble() {
+  const wrap = el("div", "flex flex-col gap-1 max-w-[80%] self-start items-start");
+  const bubble = el("div", AI_BUBBLE_CLS);
+  wrap.appendChild(bubble);
+  $("messages").appendChild(wrap);
+  return { wrap, bubble };
+}
+
 function addMessageBubble(role, content, ts, meta) {
   const isUser = role === "user";
   const wrap = el("div",
@@ -567,7 +669,7 @@ function addMessageBubble(role, content, ts, meta) {
   const bubble = el("div",
     isUser
       ? "px-3.5 py-2.5 rounded-2xl rounded-br-sm bg-blue-600 text-white text-sm leading-relaxed whitespace-pre-wrap break-words"
-      : "ai-bubble px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 text-sm leading-relaxed break-words");
+      : AI_BUBBLE_CLS);
 
   if (role === "assistant" && content) {
     bubble.innerHTML = marked.parse(content);
@@ -577,17 +679,37 @@ function addMessageBubble(role, content, ts, meta) {
 
   // Skip an empty bubble when a user message carries only attachments.
   if (content || !isUser || !atts.length) wrap.appendChild(bubble);
-  let metaText = fmtTime(ts);
-  if (role === "assistant" && meta && meta.elapsed != null) {
-    metaText += `  ·  ${meta.elapsed}s`;
-    if (meta.usage && meta.usage.total_tokens) metaText += `  ·  ${fmtNum(meta.usage.total_tokens)} tok`;
-    if (meta.usage && meta.usage.output_tokens && meta.elapsed) {
-      metaText += `  ·  ${(meta.usage.output_tokens / meta.elapsed).toFixed(1)} tok/s`;
-    }
-  }
-  wrap.appendChild(el("div", "text-[11px] text-gray-400 dark:text-slate-500", metaText));
+  wrap.appendChild(el("div", "text-[11px] text-gray-400 dark:text-slate-500",
+    bubbleMetaText(role, ts, meta)));
   $("messages").appendChild(wrap);
   return bubble;
+}
+
+// Re-render a finished assistant turn from its persisted `parts`, interleaving
+// text bubbles and tool pills in the exact order they occurred. The stats footer
+// hangs under the last text bubble (or stands alone if the turn ended on a tool).
+function renderAssistantTurn(m) {
+  let lastWrap = null;
+  for (const part of m.parts) {
+    if (part.type === "text") {
+      if (!part.content) continue;
+      const { wrap, bubble } = makeAssistantBubble();
+      bubble.innerHTML = marked.parse(part.content);
+      lastWrap = wrap;
+    } else if (part.type === "tool") {
+      $("messages").appendChild(buildToolBubble(part.name, part.target, true));
+      lastWrap = null;  // a footer should never hang off a tool pill
+    }
+  }
+  const footer = el("div", "text-[11px] text-gray-400 dark:text-slate-500",
+    bubbleMetaText("assistant", m.ts, m));
+  if (lastWrap) {
+    lastWrap.appendChild(footer);
+  } else {
+    const fwrap = el("div", "flex flex-col self-start");
+    fwrap.appendChild(footer);
+    $("messages").appendChild(fwrap);
+  }
 }
 
 // One attachment in a sent message: an image thumbnail when we still have the
@@ -610,13 +732,16 @@ function attachmentThumb(a) {
   return pill;
 }
 
-function scrollMessages() {
+function scrollMessages(force = false) {
   const m = $("messages");
-  // Clean cross-browser anchor scrolling
-  m.scrollTo({
-    top: m.scrollHeight,
-    behavior: "auto"
-  });
+  const isNearBottom = (m.scrollHeight - m.scrollTop - m.clientHeight) < 60;
+
+  if (force || isNearBottom) {
+    m.scrollTo({
+      top: m.scrollHeight,
+      behavior: "auto"
+    });
+  }
 }
 
 // ── Sending / queueing ─────────────────────────────────────────────────
@@ -640,13 +765,38 @@ function onSend() {
 
 function renderQueue() {
   const q = $("queue-indicator");
+  q.innerHTML = "";
   if (!state.queue.length) { q.classList.add("hidden"); return; }
   q.classList.remove("hidden");
-  q.textContent = `⏳ ${state.queue.length} queued: ` +
-    state.queue.map((m) => {
-      const label = m.text || `📎 ${m.attachments.length} file(s)`;
-      return `"${label.length > 30 ? label.slice(0, 30) + "…" : label}"`;
-    }).join(", ");
+
+  q.appendChild(el("div", "font-semibold mb-1.5", `⏳ ${state.queue.length} queued`));
+
+  const list = el("div", "flex flex-wrap gap-1.5");
+  state.queue.forEach((m, i) => {
+    const label = m.text || `📎 ${m.attachments.length} file(s)`;
+    const short = label.length > 40 ? label.slice(0, 40) + "…" : label;
+    const chip = el("div",
+      "flex items-center gap-1.5 pl-2 pr-1 py-0.5 rounded-lg bg-blue-100/60 dark:bg-blue-900/40 " +
+      "border border-blue-200 dark:border-blue-800/60");
+    const txt = el("span", "truncate max-w-[220px]", `"${short}"`);
+    txt.title = label;
+    chip.appendChild(txt);
+    const x = el("button",
+      "flex-none w-4 h-4 flex items-center justify-center rounded text-blue-400 " +
+      "hover:text-red-500 hover:bg-red-500/10 transition-colors",
+      "✕");
+    x.title = "Remove from queue";
+    x.addEventListener("click", () => removeQueued(i));
+    chip.appendChild(x);
+    list.appendChild(chip);
+  });
+  q.appendChild(list);
+}
+
+// Drop a still-pending follow-up before the agent gets to it.
+function removeQueued(i) {
+  state.queue.splice(i, 1);
+  renderQueue();
 }
 
 function drainQueue() {
@@ -671,18 +821,28 @@ async function sendMessage(text, attachments = []) {
 
   const userTs = new Date().toISOString();
   addMessageBubble("user", text, userTs, { attachments });
-  scrollMessages();
+  // Keep the in-memory transcript in sync with what the server persists, so
+  // switching away and back (which re-renders from s.messages) still shows the
+  // user's own messages — not just the assistant's.
+  if (s.messages) {
+    s.messages.push({
+      role: "user",
+      content: text,
+      ts: userTs,
+      attachments: attachments.map((a) => ({ name: a.name, type: a.type, size: a.size })),
+    });
+  }
+  scrollMessages(true);
 
-  const aiBubble = addMessageBubble("assistant", "", new Date().toISOString());
-  aiBubble.classList.add("streaming");
-  scrollMessages();
-
+  // Assistant text bubbles are created lazily, one per segment, so tool pills can
+  // be interleaved between them in stream order (see handleEvent).
   startTimer();
   setStatus("working", "Working…");
   clearTools();
   state.openToolBubbles = {};
+  showTyping();  // blinking dots until the first token / through tool calls
 
-  let answer = "";
+  const ctx = { bubble: null, answer: "", full: "" };
   let reader = null;
   try {
     const res = await fetch("/api/chat", {
@@ -707,7 +867,7 @@ async function sendMessage(text, attachments = []) {
         buf = buf.slice(idx + 2);
         if (!raw.startsWith("data:")) continue;
         const evt = JSON.parse(raw.slice(5).trim());
-        answer = handleEvent(evt, aiBubble, answer);
+        handleEvent(evt, ctx);
         // The turn is over on a terminal event — stop reading instead of
         // blocking on the kept-alive socket that the server won't close.
         if (evt.type === "done" || evt.type === "error") finished = true;
@@ -716,10 +876,12 @@ async function sendMessage(text, attachments = []) {
   } catch (e) {
     console.error(e);
     setStatus("error", "Connection error");
-    aiBubble.textContent = answer || "⚠️ The stream was interrupted.";
+    ensureStreamBubble(ctx);
+    ctx.bubble.textContent = ctx.full || "⚠️ The stream was interrupted.";
   } finally {
     if (reader) { try { await reader.cancel(); } catch (_) { /* already closed */ } }
-    aiBubble.classList.remove("streaming");
+    closeStreamBubble(ctx);
+    hideTyping();
     stopTimer();
     state.streaming = false;
     state.streamingId = null;
@@ -733,33 +895,89 @@ async function sendMessage(text, attachments = []) {
   }
 }
 
-function handleEvent(evt, aiBubble, answer) {
+// A blinking-dots bubble pinned at the bottom of the chat while the turn is
+// active but no text is currently streaming (before the first token and across
+// tool calls). Reused across turns; just detached/re-appended.
+function showTyping() {
+  let wrap = state.typingEl;
+  if (!wrap) {
+    wrap = el("div", "flex flex-col gap-1 max-w-[80%] self-start items-start");
+    const bubble = el("div", AI_BUBBLE_CLS + " flex items-center py-3");
+    for (let i = 0; i < 3; i++) bubble.appendChild(el("span", "typing-dot"));
+    wrap.appendChild(bubble);
+    state.typingEl = wrap;
+  }
+  $("messages").appendChild(wrap);  // (re)pin it to the very bottom
+  scrollMessages();
+}
+
+function hideTyping() {
+  if (state.typingEl) state.typingEl.remove();
+}
+
+// Open the current streaming text bubble (creating one if the previous segment
+// was closed by a tool call). `ctx.answer` holds only the current segment's text;
+// `ctx.full` holds the whole turn for persistence/fallback.
+function ensureStreamBubble(ctx) {
+  if (!ctx.bubble) {
+    hideTyping();  // the bubble's own ▋ cursor takes over the loading signal
+    ctx.bubble = makeAssistantBubble().bubble;
+    ctx.answer = "";
+    ctx.bubble.classList.add("streaming");
+  }
+  return ctx.bubble;
+}
+
+// Finalise the current segment so the next token starts a fresh bubble below
+// whatever tool pill comes next.
+function closeStreamBubble(ctx) {
+  if (ctx.bubble) {
+    ctx.bubble.classList.remove("streaming");
+    ctx.bubble = null;
+  }
+}
+
+function handleEvent(evt, ctx) {
   switch (evt.type) {
     case "token":
-      answer += evt.text;
+      ensureStreamBubble(ctx);
+      ctx.answer += evt.text;
+      ctx.full += evt.text;
       if (state.tokenChunks === 0) state.firstTokenAt = performance.now();
       state.tokenChunks++;
-      aiBubble.innerHTML = marked.parse(answer);
+      ctx.bubble.innerHTML = marked.parse(ctx.answer);
       scrollMessages();
       break;
     case "tool":
       updateTool(evt.name, evt.phase);
-      renderToolBubble(evt, aiBubble);
+      // A tool starting ends the current text segment so the pill reads after the
+      // text it follows, and any post-tool text opens a new bubble below it.
+      if (evt.phase === "start") closeStreamBubble(ctx);
+      renderToolBubble(evt);
+      showTyping();  // keep the loading signal pinned below the tool pill
       break;
     case "status":
       break;
     case "done":
-      if (evt.answer) { answer = evt.answer; aiBubble.innerHTML = marked.parse(answer); }
+      // Only fall back to a single bubble when nothing streamed (e.g. the model
+      // returned its whole answer at once); otherwise keep the segmented view.
+      if (!ctx.full && evt.answer) {
+        ensureStreamBubble(ctx);
+        ctx.answer = ctx.full = evt.answer;
+        ctx.bubble.innerHTML = marked.parse(evt.answer);
+      }
+      closeStreamBubble(ctx);
       applyDoneStats(evt);
-      setStatus("done", `Done in ${evt.elapsed}s`);
-      mergeSessionStats(evt, answer);
+      setStatus(evt.stopped ? "idle" : "done",
+                evt.stopped ? `Stopped after ${evt.elapsed}s` : `Done in ${evt.elapsed}s`);
+      mergeSessionStats(evt, ctx.full);
       break;
     case "error":
       setStatus("error", "Agent error");
-      aiBubble.innerHTML = marked.parse((answer ? answer + "\n\n" : "") + "⚠️ " + evt.message);
+      ensureStreamBubble(ctx);
+      ctx.bubble.innerHTML = marked.parse((ctx.full ? ctx.full + "\n\n" : "") + "⚠️ " + evt.message);
       break;
   }
-  return answer;
 }
 
 function mergeSessionStats(evt, answer) {
@@ -774,7 +992,8 @@ function mergeSessionStats(evt, answer) {
     s.messages.push({
       role: "assistant",
       content: evt.answer || answer || "",
-      ts: evt.ts || new Date().toISOString()
+      ts: evt.ts || new Date().toISOString(),
+      parts: evt.parts || null,
     });
   }
 }
@@ -896,19 +1115,14 @@ function updateTool(name, phase) {
 // ── In-chat tool bubbles (persistent, distinct colour) ─────────────────
 // A small violet pill inserted above the streaming answer for each tool the
 // agent runs, showing the affected file + directory once the call completes.
-function renderToolBubble(evt, aiBubble) {
+function renderToolBubble(evt) {
   state.openToolBubbles = state.openToolBubbles || {};
 
   if (evt.phase === "start") {
+    // Append at the bottom: the current text segment was just closed, so the
+    // pill reads right after the text it follows (and before any follow-up).
     const wrap = buildToolBubble(evt.name, null, false);
-    // Insert just above the assistant's (streaming) bubble so tools read
-    // in-order before the answer they inform.
-    const aiWrap = aiBubble ? aiBubble.parentElement : null;
-    if (aiWrap && aiWrap.parentElement === $("messages")) {
-      $("messages").insertBefore(wrap, aiWrap);
-    } else {
-      $("messages").appendChild(wrap);
-    }
+    $("messages").appendChild(wrap);
     state.openToolBubbles[evt.name] = wrap;
     scrollMessages();
     return;
@@ -921,13 +1135,7 @@ function renderToolBubble(evt, aiBubble) {
     open.replaceWith(buildToolBubble(evt.name, evt.target, true));
     delete state.openToolBubbles[evt.name];
   } else {
-    const wrap = buildToolBubble(evt.name, evt.target, true);
-    const aiWrap = aiBubble ? aiBubble.parentElement : null;
-    if (aiWrap && aiWrap.parentElement === $("messages")) {
-      $("messages").insertBefore(wrap, aiWrap);
-    } else {
-      $("messages").appendChild(wrap);
-    }
+    $("messages").appendChild(buildToolBubble(evt.name, evt.target, true));
   }
   scrollMessages();
 }
