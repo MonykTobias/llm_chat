@@ -28,6 +28,7 @@ from .filesystem import (
 )
 from .language import (
     analyze_architecture,
+    check_imports,
     run_linter,
     run_tests,
     run_type_check,
@@ -53,6 +54,7 @@ __all__ = [
     "run_tests",
     "run_type_check",
     "analyze_architecture",
+    "check_imports",
     # change tracking
     "build_change_report",
     "restore_snapshot",
