@@ -175,6 +175,8 @@ prompt:
       you MUST call read_file on every relevant file before responding. Partial reads produce
       wrong answers. If there are N files in scope, there must be N read_file calls before
       you write a single word of your response.**
+    - `delete_file` — delete a file. Use only when you are absolutely certain the file is not needed.
+      Pass the file path (relative to $project_path)
     - `analyze_architecture` — high-level view of modules, dependencies, structural relationships.
       Use to understand how a change ripples through the system.
     - `run_linter` — runs the $language linter. Treat results as signal; judge whether each finding matters.
@@ -396,6 +398,10 @@ prompt:
       recognize; look it up to understand what the code actually does. This is for understanding the
       existing code, not for finding solutions — that stays the plan and act stages' job.
       Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
+    - change_mode_plan — hand the task off to the planning stage. When your Context Map
+      is complete and you have nothing left to investigate, call this as your FINAL
+      action. The switch takes effect after this turn ends and the plan stage then
+      starts automatically — so finish your output first, then call it once.
     Ground every single statement in something a tool actually returned.
     Read each file at most once per run — keep what you read in working memory and
     reuse it. Only re-read a file if you have written to it, or have a concrete reason
@@ -471,6 +477,11 @@ prompt:
       a library's recommended usage, version-specific behavior, or whether an approach is still current
       best practice. Better to learn an option is wrong now than to have act discover it mid-edit.
       Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
+    - change_mode_act — hand the task off to the implementation stage. Once your Plan is
+      complete and every Open question is resolved, call this as your FINAL action. The
+      switch takes effect after this turn ends and the act stage then starts automatically
+      — so finish your plan first, then call it once. Do NOT call it while open questions
+      remain; stop and ask the human instead.
     Read each file at most once per run — keep what you read in working memory and
     reuse it. Only re-read a file if you have written to it, or have a concrete reason
     to believe it changed since you last read it.
@@ -536,12 +547,18 @@ prompt:
       COMPLETE new contents; it overwrites the whole file, so never send a fragment. Every write is
       snapshotted before it lands, so the user can see and revert each change in the UI, and the verify
       stage diffs exactly what you wrote — keep edits focused so that diff stays clean.
+    - delete_file — delete a file. Use only when you are absolutely certain the file is not needed.
+      Pass the file path (relative to $project_path)
     - web_browse — use to confirm the exact, current signature or idiomatic usage of an external API
       or library you are about to call, so you write it correctly the first time. Don't research the
       approach here — that was the plan's job; only look up the details you need to implement it.
       Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
     You do NOT have linters, type-checkers, or tests — verifying your work is the verify stage's job,
     by design. So write carefully, and hand off a precise list of what needs to be checked.
+    - change_mode_verify — hand the change off to the verification stage. Once every step of
+      the Plan is implemented and your "For verify" checklist is written, call this as your
+      FINAL action. The switch takes effect after this turn ends and the verify stage then
+      starts automatically — so finish your output first, then call it once.
     Read each file at most once per run — keep what you read in working memory and
     reuse it. Only re-read a file if you have written to it, or have a concrete reason
     to believe it changed since you last read it.
@@ -615,6 +632,13 @@ prompt:
       Search a given question at most once — if it returns nothing useful, move on, don't re-search variations
     You have NO write access — you cannot fix problems, and you should not. A verifier that edits is
     marking its own homework. Report the problem; let act fix it.
+    - change_mode_act — on a FAIL, send the work back to the act stage to fix the specific issues
+      you found. Call this as your FINAL action after writing your verdict, only when the approach
+      is sound but the implementation is wrong.
+    - change_mode_plan — on a FAIL where the APPROACH itself is wrong (not just the code), send the
+      task back to the plan stage to rethink it. Call this as your FINAL action after your verdict.
+    On a PASS, call NEITHER — the pipeline ends with you. Switching takes effect after this turn ends
+    and the next stage then starts automatically, so finish your verdict first, then call at most one.
     Read each file at most once per run — keep what you read in working memory and
     reuse it. Only re-read a file if you have written to it, or have a concrete reason
     to believe it changed since you last read it.

@@ -157,6 +157,7 @@ function bindUI() {
   $("stop-btn").addEventListener("click", onStop);
   $("model-switch").addEventListener("change", (e) => switchModel(e.target.value));
   $("role-switch").addEventListener("change", (e) => switchRole(e.target.value));
+  $("language-switch").addEventListener("change", (e) => switchLanguage(e.target.value));
 
   const input = $("message-input");
   input.addEventListener("keydown", (e) => {
@@ -331,7 +332,7 @@ async function startSession() {
     selectSession(data.session.id);
     $("path-input").value = "";
     // Project sessions auto-kick off a review; chat sessions wait for the user.
-    if (!isChat) sendMessage("Review this project.");
+    // if (!isChat) sendMessage("Review this project.");
   } catch (e) {
     errBox.textContent = "Could not start session.";
     console.error(e);
@@ -429,6 +430,25 @@ async function switchModel(newModel) {
   } catch (e) {
     console.error(e);
     alert("Could not switch model.");
+  }
+}
+
+async function switchLanguage(newLang) {
+  const s = activeSession();
+  if (!s || s.restored) return;
+  try {
+    const res = await fetch("/api/session/language", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: s.id, language: newLang }),
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    s.language = data.language;
+    $("chat-subtitle").textContent = subtitleFor(s);
+  } catch (e) {
+    console.error(e);
+    alert("Could not switch language.");
   }
 }
 
@@ -552,12 +572,23 @@ function renderActive() {
     rsw.appendChild(o);
   }
 
-  // Hide both switchers while streaming, show them once idle.
+  const lsw = $("language-switch");
+  lsw.innerHTML = "";
+  for (const lang of state.languages) {
+    const o = el("option", null, lang);
+    o.value = lang;
+    if (lang === s.language) o.selected = true;
+    lsw.appendChild(o);
+  }
+
+  // Hide all switchers while streaming, show them once idle.
   sw.classList.add("hidden");
   rsw.classList.add("hidden");
+  lsw.classList.add("hidden");
   if (!state.streaming) {
     sw.classList.remove("hidden");
     rsw.classList.remove("hidden");
+    lsw.classList.remove("hidden");
   }
 
   for (const m of s.messages) {
@@ -651,6 +682,15 @@ function makeAssistantBubble() {
   wrap.appendChild(bubble);
   $("messages").appendChild(wrap);
   return { wrap, bubble };
+}
+
+// A centered "→ switched to <stage>" marker shown when the review pipeline
+// auto-advances from one stage to the next within a single send.
+function addStageDivider(nextMode) {
+  const wrap = el("div", "self-center my-2 text-xs opacity-60");
+  wrap.appendChild(el("span", null, `→ switched to ${nextMode}`));
+  $("messages").appendChild(wrap);
+  scrollMessages();
 }
 
 function addMessageBubble(role, content, ts, meta) {
@@ -869,8 +909,12 @@ async function sendMessage(text, attachments = []) {
         const evt = JSON.parse(raw.slice(5).trim());
         handleEvent(evt, ctx);
         // The turn is over on a terminal event — stop reading instead of
-        // blocking on the kept-alive socket that the server won't close.
-        if (evt.type === "done" || evt.type === "error") finished = true;
+        // blocking on the kept-alive socket that the server won't close. A `done`
+        // carrying `next_mode` is NOT terminal: the pipeline is auto-advancing to
+        // the next stage, which streams more events on this same connection.
+        if ((evt.type === "done" && !evt.next_mode) || evt.type === "error") {
+          finished = true;
+        }
       }
     }
   } catch (e) {
@@ -968,9 +1012,21 @@ function handleEvent(evt, ctx) {
       }
       closeStreamBubble(ctx);
       applyDoneStats(evt);
-      setStatus(evt.stopped ? "idle" : "done",
-                evt.stopped ? `Stopped after ${evt.elapsed}s` : `Done in ${evt.elapsed}s`);
       mergeSessionStats(evt, ctx.full);
+      if (evt.next_mode) {
+        // Pipeline is auto-advancing: this stage finished but the next one is
+        // about to stream on the same connection. Mark the handoff, reset the
+        // stream context so the next stage gets a fresh bubble, and keep the
+        // "working" status instead of declaring the whole turn done.
+        addStageDivider(evt.next_mode);
+        ctx.full = "";
+        ctx.answer = "";
+        setStatus("working", `Switched to ${evt.next_mode}…`);
+        showTyping();
+      } else {
+        setStatus(evt.stopped ? "idle" : "done",
+                  evt.stopped ? `Stopped after ${evt.elapsed}s` : `Done in ${evt.elapsed}s`);
+      }
       break;
     case "error":
       setStatus("error", "Agent error");
@@ -985,6 +1041,28 @@ function mergeSessionStats(evt, answer) {
   if (!s) return;
   s.totals = evt.totals;
   s.last = evt.last;
+
+  // The agent may have changed the language mid-turn via the set_language tool;
+  // reflect that in the session, the header switcher and the subtitle.
+  if (evt.language && evt.language !== s.language) {
+    s.language = evt.language;
+    const lsw = $("language-switch");
+    if (lsw) lsw.value = evt.language;
+    $("chat-subtitle").textContent = subtitleFor(s);
+  }
+
+  // The stage may have called a change_mode_* tool to hand off to the next
+  // pipeline stage; the server already advanced the role and will auto-run it.
+  // Mirror that here: update the session, the header role switcher, the tool
+  // checkboxes and the subtitle, just like a manual role switch.
+  if (evt.next_mode && evt.next_mode !== s.role) {
+    s.role = evt.next_mode;
+    s.enabled_tools = (state.toolsByRole[s.role] || []).slice();
+    const rsw = $("role-switch");
+    if (rsw) rsw.value = s.role;
+    renderTools(s);
+    $("chat-subtitle").textContent = subtitleFor(s);
+  }
 
   // Backfill the message to the state session history array so it re-renders
   // as markdown (not raw text) when the session is reselected.
@@ -1143,8 +1221,9 @@ function renderToolBubble(evt) {
 function buildToolBubble(name, target, done) {
   const isWrite = name === "write_file";
   const isWeb = name === "web_browse";
-  // Writes get a distinct amber tint, web browsing a sky tint, so each reads
-  // clearly apart from the violet reads.
+  const isDelete = name === "delete_file";
+  // Writes get a distinct amber tint, web browsing a sky tint, deletes a red tint
+  // (destructive — stands apart), so each reads clearly apart from the violet reads.
   const wrap = el("div",
     "self-start flex items-center gap-2 max-w-[80%] text-xs px-3 py-1.5 rounded-lg " + (isWrite
       ? "bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 " +
@@ -1152,6 +1231,9 @@ function buildToolBubble(name, target, done) {
       : isWeb
       ? "bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800/60 " +
         "text-sky-700 dark:text-sky-300"
+      : isDelete
+      ? "bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800/60 " +
+        "text-red-700 dark:text-red-300"
       : "bg-violet-50 dark:bg-violet-950/40 border border-violet-200 dark:border-violet-800/60 " +
         "text-violet-700 dark:text-violet-300"));
 
@@ -1159,33 +1241,56 @@ function buildToolBubble(name, target, done) {
     ? "text-amber-500 dark:text-amber-400"
     : isWeb
     ? "text-sky-500 dark:text-sky-400"
+    : isDelete
+    ? "text-red-500 dark:text-red-400"
     : "text-violet-500 dark:text-violet-400";
   const icon = el("span", done ? accent : accent + " animate-spin inline-block",
-    done ? (isWrite ? "📝" : isWeb ? "🌐" : "🔧") : "⟳");
+    done ? (isWrite ? "📝" : isWeb ? "🌐" : isDelete ? "🗑️" : "🔧") : "⟳");
   wrap.appendChild(icon);
   wrap.appendChild(el("span", "font-semibold", name));
 
   // web_browse: show the site searched and the query, mirroring the file label.
-  if (isWeb && target && (target.url || target.query)) {
-    const sep = el("span", "text-sky-300 dark:text-sky-700", "·");
-    wrap.appendChild(sep);
-    const detail = el("span",
-      "font-mono text-[11px] truncate text-sky-600 dark:text-sky-400/90");
-    const bits = [];
-    if (target.url) bits.push(`🔗 ${target.url}`);
-    if (target.query) bits.push(`🔎 ${target.query}`);
-    detail.textContent = bits.join("  ");
-    detail.title = bits.join("  ");
-    wrap.appendChild(detail);
-    return wrap;
+ if (isWeb && target && (target.url || target.query)) {
+  const sep = el("span", "text-sky-300 dark:text-sky-700", "·");
+  wrap.appendChild(sep);
+
+  // 1. Change "span" to "a"
+  const detail = el("a",
+    "font-mono text-[11px] truncate text-sky-600 dark:text-sky-400/90 hover:underline cursor-pointer");
+
+  const bits = [];
+  if (target.url) {
+    bits.push(`🔗 ${target.url}`);
+    // 2. Set the href to the actual URL
+    detail.href = target.url;
+    detail.target = "_blank"; // Opens in a new tab
+    detail.rel = "noopener noreferrer"; // Security best practice
+  } else if (target.query) {
+    bits.push(`🔎 ${target.query}`);
+    // 3. Optional: Fallback to a search engine link if it's just a query
+    detail.href = `https://www.google.com/search?q=${encodeURIComponent(target.query)}`;
+    detail.target = "_blank";
+    detail.rel = "noopener noreferrer";
   }
+
+  detail.textContent = bits.join("  ");
+  detail.title = bits.join("  ");
+  wrap.appendChild(detail);
+  return wrap;
+}
 
   if (target) {
     const sep = el("span", isWrite
-      ? "text-amber-300 dark:text-amber-700" : "text-violet-300 dark:text-violet-700", "·");
+      ? "text-amber-300 dark:text-amber-700"
+      : isDelete
+      ? "text-red-300 dark:text-red-700"
+      : "text-violet-300 dark:text-violet-700", "·");
     wrap.appendChild(sep);
     const detail = el("span", "font-mono text-[11px] truncate " + (isWrite
-      ? "text-amber-600 dark:text-amber-400/90" : "text-violet-500 dark:text-violet-400/90"));
+      ? "text-amber-600 dark:text-amber-400/90"
+      : isDelete
+      ? "text-red-600 dark:text-red-400/90"
+      : "text-violet-500 dark:text-violet-400/90"));
     detail.title = target.path;
     detail.textContent = `📄 ${target.name}` + (target.dir && target.dir !== "." ? `  📁 ${target.dir}` : "");
     wrap.appendChild(detail);
@@ -1203,7 +1308,9 @@ function buildToolBubble(name, target, done) {
     }
   } else if (done) {
     wrap.appendChild(el("span",
-      (isWrite ? "text-amber-400 dark:text-amber-500" : "text-violet-400 dark:text-violet-500") + " italic",
+      (isWrite ? "text-amber-400 dark:text-amber-500"
+        : isDelete ? "text-red-400 dark:text-red-500"
+        : "text-violet-400 dark:text-violet-500") + " italic",
       "project"));
   }
   return wrap;

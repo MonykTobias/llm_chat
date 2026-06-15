@@ -18,9 +18,11 @@ from tools.tools import (
     analyze_architecture,
     list_all_files,
     read_file,
+    delete_file,
     run_linter,
     run_tests,
     run_type_check,
+    set_language,
     write_file,
 )
 
@@ -34,8 +36,10 @@ DEFAULT_REVIEW_TOOLS = [
     analyze_architecture,
     run_type_check,
     read_file,
+    delete_file,
     list_all_files,
     write_file,
+    set_language,
 ]
 
 

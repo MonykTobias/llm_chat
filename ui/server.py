@@ -54,7 +54,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 SESSIONS_FILE = Path(__file__).resolve().parent / "sessions.json"
 HOST, PORT = "127.0.0.1", 8765
 
-LANGUAGES = ["english","python", "javascript", "typescript", "go", "rust", "java"]
+from structured_output import LANGUAGES  # noqa: E402  (single source of truth)
 with open("config.yaml", "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 MODELS = []
@@ -391,18 +391,27 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
         payload = {
             "messages": [{"role": "user", "content": content}],
             "project_path": session["path"],
-            "language": session["language"],
             "model": session["model"],
         }
         session["started"] = True
     else:
         payload = {"messages": [{"role": "user", "content": content}]}
 
+    # Sent every turn so switching language mid-session (via the header switcher
+    # or the set_language tool) takes effect immediately. session["language"] is
+    # the canonical value; the read-back below folds any tool change back in.
+    payload["language"] = session["language"]
+
     # Sent every turn so toggling tools mid-session takes effect immediately.
     # The tool-gate middleware restricts the model to exactly these names.
     payload["enabled_tools"] = session.get(
         "enabled_tools", _tools_for_role(session.get("role", DEFAULT_ROLE))
     )
+
+    # Reset the mode-switch flag at the start of every turn so a stale value from
+    # a previous stage can never re-trigger. Only a change_mode_* tool call during
+    # THIS turn re-sets it; we read it back below to advance the pipeline.
+    payload["review_mode"] = ""
 
     started = time.monotonic()
     answer_parts: list[str] = []
@@ -496,6 +505,32 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
         elapsed = round(time.monotonic() - started, 2)
         answer = "".join(answer_parts).strip()
 
+        # The set_language tool writes language into the graph state. Fold any
+        # such change back into the session so it persists and the header
+        # switcher (via the `done` event below) reflects reality.
+        try:
+            final_lang = agent.get_state(config).values.get("language")
+            if final_lang and final_lang != session.get("language"):
+                session["language"] = final_lang
+        except Exception:  # noqa: BLE001
+            pass
+
+        # A change_mode_* tool may have requested the next pipeline stage by
+        # writing `review_mode` into graph state. Read it back and, if it names a
+        # different role valid for THIS session's mode, flag the switch so the
+        # caller (_handle_chat) can advance the role and auto-run the next stage.
+        # The mode check keeps a folder-less chat session from ever jumping into a
+        # project-only stage.
+        pending_mode = None
+        try:
+            requested = (agent.get_state(config).values.get("review_mode") or "").strip()
+            cur = session.get("role", DEFAULT_ROLE)
+            if (requested in ROLES and requested != cur
+                    and _mode_for_role(requested) == session.get("mode", "project")):
+                pending_mode = requested
+        except Exception:  # noqa: BLE001
+            pass
+
         usage = {
             "input_tokens": (last_usage or {}).get("input_tokens", 0),
             "output_tokens": (last_usage or {}).get("output_tokens", 0),
@@ -530,14 +565,19 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
             "elapsed": elapsed,
             "totals": session["totals"],
             "last": session["last"],
+            "language": session["language"],
+            "role": session.get("role"),     # the stage that produced this turn
+            "next_mode": pending_mode,        # stage about to auto-run, or None
             "context_window": agents._cfg["agents"].get(
                 session["model"], {}).get("context_window"),
             "ts": ts,
         })
+        return pending_mode
     except Exception as e:  # noqa: BLE001
         import traceback
         traceback.print_exc()
         emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
+        return None
 
 
 # ── HTTP handler ────────────────────────────────────────────────────────────
@@ -657,6 +697,22 @@ class Handler(BaseHTTPRequestHandler):
             session["model"] = new_model
             _save_sessions()
             self._send_json({"ok": True, "model": new_model})
+        elif route == "/api/session/language":
+            data = self._read_body()
+            sid = data.get("id")
+            new_language = (data.get("language") or "").strip().lower()
+            session = _sessions.get(sid)
+            if not session:
+                self._send_json({"error": "unknown session"}, 404)
+                return
+            if new_language not in LANGUAGES:
+                self._send_json({"error": f"unknown language '{new_language}'"}, 400)
+                return
+            # Picked up on the next turn, which re-injects session["language"]
+            # into the graph state (see _run_turn).
+            session["language"] = new_language
+            _save_sessions()
+            self._send_json({"ok": True, "language": new_language})
         elif route == "/api/session/role":
             data = self._read_body()
             sid = data.get("id")
@@ -800,7 +856,22 @@ class Handler(BaseHTTPRequestHandler):
         with _cancels_lock:
             _cancels[sid] = cancel
         try:
-            _run_turn(session, message, emit, attachments, cancel)
+            # Pipeline auto-advance: a stage may call a change_mode_* tool to hand
+            # off to the next stage. _run_turn returns the requested next role (or
+            # None); when set, we switch the session's role and re-run with the new
+            # stage's kickoff message. Bounded so a plan<->act ping-pong on repeated
+            # failures can't loop forever.
+            MAX_STAGES = 8
+            text, atts = message, attachments
+            for _ in range(MAX_STAGES):
+                pending = _run_turn(session, text, emit, atts, cancel)
+                if not pending or cancel.is_set():
+                    break
+                session["role"] = pending
+                session["enabled_tools"] = _tools_for_role(pending)
+                _save_sessions()
+                text = agents.AGENTS[pending].kickoff_message
+                atts = None     # auto-stage kickoffs carry no attachments
         finally:
             stop.set()
             with _cancels_lock:

@@ -7,7 +7,8 @@ from agents.base import BaseAgent
 from agents.llm_factory import make_system_prompt
 from tools.tools import (
     list_all_files, read_file, analyze_architecture,
-    run_type_check, run_tests, run_linter, build_change_report, web_browse,
+    run_type_check, run_tests, run_linter, build_change_report, set_language, web_browse,
+    change_mode_act, change_mode_plan,
 )
 
 DEFAULT_REVIEW_TOOLS = [
@@ -19,6 +20,9 @@ DEFAULT_REVIEW_TOOLS = [
     run_type_check,
     build_change_report,
     web_browse,
+    set_language,
+    change_mode_act,
+    change_mode_plan,
 ]
 
 class CodeReviewVerify(BaseAgent):

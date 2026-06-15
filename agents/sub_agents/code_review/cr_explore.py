@@ -5,13 +5,18 @@ from typing import Any, List
 
 from agents.base import BaseAgent
 from agents.llm_factory import make_system_prompt
-from tools.tools import list_all_files, read_file, analyze_architecture, web_browse
+from tools.tools import (
+    list_all_files, read_file, analyze_architecture, set_language, web_browse,
+    change_mode_plan,
+)
 
 DEFAULT_REVIEW_TOOLS = [
     read_file,
     list_all_files,
     analyze_architecture,
     web_browse,
+    set_language,
+    change_mode_plan,
 ]
 
 class CodeReviewExplore(BaseAgent):
