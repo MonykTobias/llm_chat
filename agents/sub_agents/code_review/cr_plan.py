@@ -7,7 +7,7 @@ from agents.base import BaseAgent
 from agents.llm_factory import make_system_prompt
 from tools.tools import (
     list_all_files, read_file, analyze_architecture, build_change_report,
-    set_language, web_browse, change_mode_act,
+    set_language, web_browse,
 )
 
 DEFAULT_REVIEW_TOOLS = [
@@ -17,7 +17,6 @@ DEFAULT_REVIEW_TOOLS = [
     build_change_report,
     web_browse,
     set_language,
-    change_mode_act,
 ]
 
 class CodeReviewPlan(BaseAgent):

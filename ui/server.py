@@ -433,32 +433,83 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
     tool_index_by_id: dict[str, int] = {}  # tool_call id  -> index
     tool_index_by_name: dict[str, int] = {}  # tool name    -> latest index
 
+    # Shared emit helpers so native streaming (below) and the cr_review
+    # orchestrator's "custom" channel produce identical token/tool SSE events and
+    # transcript `parts`.
+    def emit_text(text: str) -> None:
+        if not text:
+            return
+        answer_parts.append(text)
+        cur_text.append(text)
+        emit({"type": "token", "text": text})
+
+    def emit_tool_start(name: str, target: dict | None = None) -> None:
+        if name in active_tools:
+            return
+        active_tools.add(name)
+        flush_text()  # text before the tool call ends its own segment here
+        emit({"type": "tool", "name": name, "phase": "start"})
+
+    def emit_tool_end(name: str, target: dict | None = None) -> None:
+        active_tools.discard(name)
+        flush_text()
+        parts.append({"type": "tool", "name": name, "target": target})
+        emit({"type": "tool", "name": name, "phase": "end", "target": target})
+
     stopped = False
     try:
         agent = agents.graph_for(session.get("role"), session.get("model"))
         # Keep a handle on the generator so we can close() it promptly on cancel,
         # which sends GeneratorExit into the graph and stops it advancing.
-        stream = agent.stream(payload, config=config, stream_mode="messages")
-        for chunk, _meta in stream:
+        # "messages" carries native LLM tokens/tool calls; "custom" carries the
+        # cr_review orchestrator's per-stage progress (its own grammar-constrained
+        # JSON messages are suppressed below so they never reach the UI raw).
+        stream = agent.stream(payload, config=config,
+                              stream_mode=["messages", "custom"])
+        for mode, data in stream:
             # User hit Stop: quit pulling, close the generator, keep partial work.
             if cancel.is_set():
                 stopped = True
                 stream.close()
                 break
 
+            # Orchestrator stages render through the custom channel: clean reasoning
+            # text + tool pills, already shaped like the native events above.
+            if mode == "custom":
+                if isinstance(data, dict):
+                    kind = data.get("kind")
+                    if kind == "text":
+                        emit_text(data.get("text", ""))
+                    elif kind == "tool_start":
+                        emit_tool_start(data.get("name", "tool"), data.get("target"))
+                    elif kind == "tool_end":
+                        emit_tool_end(data.get("name", "tool"), data.get("target"))
+                    elif kind == "stage":
+                        # The cr_review orchestrator switched to a new pipeline
+                        # stage. End the current text segment, record the handoff
+                        # so it re-renders, and push a dedicated stage bubble.
+                        flush_text()
+                        label = data.get("label") or data.get("stage") or "next stage"
+                        parts.append({"type": "stage", "label": label})
+                        emit({"type": "stage", "label": label,
+                              "stage": data.get("stage")})
+                continue
+
+            chunk, _meta = data
+            # Drop the orchestrator stages' internal model/tool messages: they are
+            # grammar-constrained structured-output JSON, surfaced cleanly via the
+            # "custom" events above instead.
+            if (_meta or {}).get("langgraph_node") in agents.STAGE_NODE_NAMES:
+                continue
+
             # Tool result coming back
             if isinstance(chunk, ToolMessage):
                 name = chunk.name or "tool"
-                active_tools.discard(name)
                 idx = tool_index_by_id.get(getattr(chunk, "tool_call_id", None))
                 if idx is None:
                     idx = tool_index_by_name.get(name)
                 target = _extract_target(tool_args.get(idx, "")) if idx is not None else None
-                # Close any text streamed before this tool into its own segment,
-                # then record the tool so parts read in true chronological order.
-                flush_text()
-                parts.append({"type": "tool", "name": name, "target": target})
-                emit({"type": "tool", "name": name, "phase": "end", "target": target})
+                emit_tool_end(name, target)
                 continue
 
             if isinstance(chunk, AIMessageChunk):
@@ -479,11 +530,7 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                     name = tc.get("name")
                     if name:
                         tool_index_by_name[name] = idx
-                        if name not in active_tools:
-                            active_tools.add(name)
-                            # Text before the tool call ends its segment here.
-                            flush_text()
-                            emit({"type": "tool", "name": name, "phase": "start"})
+                        emit_tool_start(name)
 
                 # Streamed answer text
                 text = chunk.content
@@ -492,10 +539,7 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                         p.get("text", "") if isinstance(p, dict) else str(p)
                         for p in text
                     )
-                if text:
-                    answer_parts.append(text)
-                    cur_text.append(text)
-                    emit({"type": "token", "text": text})
+                emit_text(text)
 
                 # Token accounting (Ollama fills this on the final chunk)
                 if getattr(chunk, "usage_metadata", None):

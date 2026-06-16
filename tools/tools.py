@@ -34,11 +34,6 @@ from .language import (
     run_type_check,
 )
 from .modes import (
-    REVIEW_MODES,
-    change_mode_act,
-    change_mode_explore,
-    change_mode_plan,
-    change_mode_verify,
     set_language,
 )
 from .web import web_browse
@@ -62,9 +57,4 @@ __all__ = [
     "web_browse",
     # modes / language switch
     "set_language",
-    "change_mode_explore",
-    "change_mode_plan",
-    "change_mode_act",
-    "change_mode_verify",
-    "REVIEW_MODES",
 ]

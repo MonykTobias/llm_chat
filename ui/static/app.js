@@ -693,6 +693,21 @@ function addStageDivider(nextMode) {
   scrollMessages();
 }
 
+// A dedicated, centered "bubble" announcing that the cr_review orchestrator has
+// moved to a new pipeline stage (explore / plan / act / verify). Distinct from
+// text bubbles and tool pills so the stage hand-off is unmistakable in the chat.
+function addStageBanner(label) {
+  const wrap = el("div", "self-center my-3 flex items-center gap-2 w-full max-w-[80%]");
+  wrap.appendChild(el("div", "flex-1 h-px bg-gray-200 dark:bg-slate-700"));
+  wrap.appendChild(el("div",
+    "px-3 py-1 rounded-full text-xs font-semibold bg-indigo-100 text-indigo-700 " +
+    "dark:bg-indigo-900/50 dark:text-indigo-300 border border-indigo-200 " +
+    "dark:border-indigo-800 whitespace-nowrap", label));
+  wrap.appendChild(el("div", "flex-1 h-px bg-gray-200 dark:bg-slate-700"));
+  $("messages").appendChild(wrap);
+  scrollMessages();
+}
+
 function addMessageBubble(role, content, ts, meta) {
   const isUser = role === "user";
   const wrap = el("div",
@@ -739,6 +754,9 @@ function renderAssistantTurn(m) {
     } else if (part.type === "tool") {
       $("messages").appendChild(buildToolBubble(part.name, part.target, true));
       lastWrap = null;  // a footer should never hang off a tool pill
+    } else if (part.type === "stage") {
+      addStageBanner(part.label);
+      lastWrap = null;  // a footer should never hang off a stage banner
     }
   }
   const footer = el("div", "text-[11px] text-gray-400 dark:text-slate-500",
@@ -1001,6 +1019,14 @@ function handleEvent(evt, ctx) {
       showTyping();  // keep the loading signal pinned below the tool pill
       break;
     case "status":
+      break;
+    case "stage":
+      // cr_review orchestrator entered a new pipeline stage: close the current
+      // text segment, drop a dedicated stage bubble, and keep the loader pinned.
+      closeStreamBubble(ctx);
+      addStageBanner(evt.label);
+      setStatus("working", `${evt.label}…`);
+      showTyping();
       break;
     case "done":
       // Only fall back to a single bubble when nothing streamed (e.g. the model

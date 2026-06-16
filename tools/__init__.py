@@ -5,14 +5,9 @@ well as the legacy ``from tools.tools import read_file``. See ``tools.tools`` fo
 the submodule map.
 """
 from .tools import (  # noqa: F401
-    REVIEW_MODES,
     analyze_architecture,
     build_change_report,
-    change_mode_act,
     check_imports,
-    change_mode_explore,
-    change_mode_plan,
-    change_mode_verify,
     delete_file,
     list_all_files,
     read_file,
@@ -39,9 +34,4 @@ __all__ = [
     "restore_snapshot",
     "web_browse",
     "set_language",
-    "change_mode_explore",
-    "change_mode_plan",
-    "change_mode_act",
-    "change_mode_verify",
-    "REVIEW_MODES",
 ]
