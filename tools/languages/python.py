@@ -26,6 +26,7 @@ from tools._common import _IGNORE, _rel, _truncate, _vendor_ignore_regex
 from .base import (
     _create_managed_venv,
     _find_project_venv,
+    _module_importable,
     _provision_once,
     _run,
     _run_python_tool,
@@ -88,6 +89,7 @@ def run_linter(path: str, language: str) -> str:
 def run_tests(path: str, language: str, include_coverage: bool = True) -> str:
     """pytest, scoped out of vendored dirs so it doesn't collect .venv's own tests."""
     _provision_once(path, "python", _provision)
+    py = _venv_python(path)
     # -o norecursedirs overrides any project config so collection never descends
     # into .venv/node_modules/build; explicit --ignore for the ones at the root;
     # -q / no cache to trim noise.
@@ -98,9 +100,34 @@ def run_tests(path: str, language: str, include_coverage: bool = True) -> str:
         if (root / name).is_dir():
             args.append(f"--ignore={root / name}")
     args.append(path)
-    if include_coverage:
+    # --cov needs the pytest-cov plugin in `py`. If it's missing, pytest aborts the
+    # whole run with "unrecognized arguments: --cov" (the model misreads this as
+    # "tests can't run"), so only add it when the plugin is actually importable and
+    # otherwise note that coverage was skipped — the pass/fail result still lands.
+    cov = include_coverage and _has_pytest_cov(py)
+    if cov:
         args.append("--cov")
-    return _run_python_tool(_venv_python(path), "pytest", args)
+    out = _run_python_tool(py, "pytest", args)
+    if include_coverage and not cov:
+        out = ("[coverage skipped: pytest-cov is not installed in the test "
+               "interpreter, so pytest ran without --cov. This is an environment "
+               "limitation, not a test failure — judge the results below on their "
+               "own.]\n" + out)
+    return out
+
+
+# pytest-cov availability per interpreter — the probe spawns a process, so cache
+# it for the server's lifetime (same interpreter answers the same way every time).
+_PYTEST_COV: dict[str, bool] = {}
+
+
+def _has_pytest_cov(python_exe: str) -> bool:
+    """Whether the pytest-cov plugin is importable in `python_exe` (cached)."""
+    ok = _PYTEST_COV.get(python_exe)
+    if ok is None:
+        ok = _module_importable(python_exe, "pytest_cov")
+        _PYTEST_COV[python_exe] = ok
+    return ok
 
 
 def run_type_check(path: str, language: str) -> str:

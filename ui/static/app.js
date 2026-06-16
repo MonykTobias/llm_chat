@@ -680,7 +680,7 @@ function addStageDivider(nextMode) {
   scrollMessages();
 }
 
-// A dedicated, centered "bubble" announcing that the cr_review orchestrator has
+// A dedicated, centered "bubble" announcing that the code-assistant orchestrator has
 // moved to a new pipeline stage (explore / plan / act / verify). Distinct from
 // text bubbles and tool pills so the stage hand-off is unmistakable in the chat.
 function addStageBanner(label) {
@@ -998,7 +998,7 @@ function handleEvent(evt, ctx) {
     case "status":
       break;
     case "stage":
-      // cr_review orchestrator entered a new pipeline stage: close the current
+      // code-assistant orchestrator entered a new pipeline stage: close the current
       // text segment, drop a dedicated stage bubble, and keep the loader pinned.
       closeStreamBubble(ctx);
       addStageBanner(evt.label);

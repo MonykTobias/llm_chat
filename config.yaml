@@ -1,16 +1,7 @@
 recursion_limit: 1000 # (ReAct calls)
 
 agents:
-  main_agent:
-    model: "qwen3:14b"
-    base_url: "http://localhost:11434/v1"
-    api_key: "ollama"
-    temperature: 0.0
-    context_window: 262144
-    max_tokens: 32768
-    thinking: true
-
-  qwen3.5_9b:
+  main_agent: # qwen family has great Tool calling support even at low params
     model: "qwen3.5:9b"
     base_url: "http://localhost:11434/v1"
     api_key: "ollama"
@@ -19,14 +10,14 @@ agents:
     max_tokens: 32768
     thinking: true
 
-  qwen3.5_27b:
-    model: "qwen3.5:27b"
+  qwen2.5-coder-14b-q8_0:
+    model: "qwen2.5-coder:14b-instruct-q8_0"
     base_url: "http://localhost:11434/v1"
     api_key: "ollama"
     temperature: 0.0
     context_window: 262144
     max_tokens: 32768
-    thinking: true
+    thinking: false # has to be false (qwen2.5-coder does not support thinking)
 
   qwen3-coder-30b:
     model: "qwen3-coder:30b"
@@ -48,15 +39,6 @@ agents:
 
   qwen3.6_35b-a3b:
     model: "qwen3.6:35b-a3b"
-    base_url: "http://localhost:11434/v1"
-    api_key: "ollama"
-    temperature: 0.0
-    context_window: 262144
-    max_tokens: 32768
-    thinking: true
-
-  qwen3_32b:
-    model: "qwen3:32b"
     base_url: "http://localhost:11434/v1"
     api_key: "ollama"
     temperature: 0.0
@@ -104,35 +86,8 @@ agents:
     thinking: true
     thinking_token: true
 
-  qwen3_14b:
-    model: "qwen3:14b"
-    base_url: "http://localhost:11434/v1"
-    api_key: "ollama"
-    temperature: 0.0
-    context_window: 262144
-    max_tokens: 32768
-    thinking: true
-
-  qwen3_8b:
-    model: "qwen3:8b"
-    base_url: "http://localhost:11434/v1"
-    api_key: "ollama"
-    temperature: 0.0
-    context_window: 262144
-    max_tokens: 32768
-    thinking: true
-
   mixtral:8x7b:
     model: "mixtral:8x7b"
-    base_url: "http://localhost:11434/v1"
-    api_key: "ollama"
-    temperature: 0.0
-    context_window: 262144
-    max_tokens: 32768
-    thinking: false
-
-  deepseek-r1:14b:
-    model: "deepseek-r1:14b"
     base_url: "http://localhost:11434/v1"
     api_key: "ollama"
     temperature: 0.0
@@ -640,10 +595,10 @@ prompt:
     The orchestrator will route based on "verdict".
     </termination>
 
-  # cr_review is the orchestrator role: selecting it and sending a task runs the
+  # code-assistant is the orchestrator role: selecting it and sending a task runs the
   # full explore -> plan -> act -> verify pipeline in one turn (see
-  # agents/sub_agents/code_review/orchestrator.py). It has no top-level LLM, so this
+  # agents/sub_agents/code-assistant/orchestrator.py). It has no top-level LLM, so this
   # template is NOT used to build a prompt — it exists only so the UI lists the role.
-  cr_review: |
+  code-assistant: |
     Orchestrator role. Sending a task runs the explore -> plan -> act -> verify
     code-review pipeline end to end. (This template is not used as a system prompt.)

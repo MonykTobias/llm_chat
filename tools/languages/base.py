@@ -113,6 +113,18 @@ def _run_python_tool(python_exe: str, module: str, args: "list[str]",
     return _truncate(out) or f"{module} ran and produced no output."
 
 
+def _module_importable(python_exe: str, module: str) -> bool:
+    """Best-effort: can `python_exe` import `module`? Used to feature-detect
+    optional plugins (e.g. pytest-cov) before passing flags that depend on them,
+    so a missing plugin degrades gracefully instead of crashing the whole run."""
+    try:
+        result = subprocess.run([python_exe, "-c", f"import {module}"],
+                                capture_output=True, text=True, timeout=30)
+        return result.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _provision_once(project: str, language: str, fn) -> None:
     """Run `fn(project)` (dependency provisioning) at most once per project+language.
 

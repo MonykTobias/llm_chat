@@ -1,7 +1,7 @@
 """
-The cr_review orchestrator: one role that drives the whole coding pipeline.
+The code-assistant orchestrator: one role that drives the whole coding pipeline.
 
-Selecting the `cr_review` role and sending a task runs the four stage agents
+Selecting the `code-assistant` role and sending a task runs the four stage agents
 end to end in a single turn:
 
     explore  ->  plan  ->  act  ->  verify  ->  (PASS? END : plan)
@@ -171,7 +171,7 @@ def _is_pass(report: str) -> bool:
 class CodeReviewOrchestrator:
     """Drives explore->plan->act->verify as one compiled graph per model."""
 
-    name = "cr_review"
+    name = "code-assistant"
     requires_project = True
     kickoff_message = (
         "Run the full explore -> plan -> act -> verify pipeline on this task."
@@ -338,8 +338,15 @@ class CodeReviewOrchestrator:
         report: str | None = None
 
         for _ in range(MAX_STEPS_PER_STAGE):
-            turn = self._next_turn(structured,
-                                   [SystemMessage(content=sys_prompt)] + history + new_msgs)
+            turn, usage = self._next_turn(
+                structured,
+                [SystemMessage(content=sys_prompt)] + history + new_msgs)
+            # Surface this model call's token usage on the custom channel. The
+            # server can't see the orchestrator's internal model calls (their
+            # native "messages" chunks are suppressed), so without this the UI's
+            # tok/s and context-window meters stay empty for the code-assistant role.
+            if usage.get("output_tokens") or usage.get("input_tokens"):
+                writer({"kind": "usage", "usage": usage})
             note = (turn.note or "").strip()
             tool_name = (turn.tool_to_call or "").strip() or None
 
@@ -394,15 +401,32 @@ class CodeReviewOrchestrator:
 
     # ── model turn (structured output, with a robust fallback) ───────────────
     @staticmethod
-    def _next_turn(structured: Any, messages: list) -> AgentTurnSchema:
+    def _usage_from(resp: Any) -> dict:
+        """Pull token usage from a structured-output response's raw AIMessage.
+
+        The orchestrator's model calls never reach the server's native token
+        stream, so this is the only place that knows how many tokens each turn
+        cost — the UI's tok/s and context-window meters are fed from it."""
+        raw = resp.get("raw") if isinstance(resp, dict) else resp
+        um = getattr(raw, "usage_metadata", None) or {}
+        try:
+            return {"input_tokens": int(um.get("input_tokens", 0) or 0),
+                    "output_tokens": int(um.get("output_tokens", 0) or 0),
+                    "total_tokens": int(um.get("total_tokens", 0) or 0)}
+        except (TypeError, ValueError):
+            return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    @staticmethod
+    def _next_turn(structured: Any, messages: list) -> "tuple[AgentTurnSchema, dict]":
         try:
             resp = structured.invoke(messages)
         except Exception as e:  # noqa: BLE001 — never crash the pipeline on a bad turn
-            return AgentTurnSchema(note="", tool_to_call=None,
-                                   stage_report=f"(model call failed: {type(e).__name__}: {e})")
+            return (AgentTurnSchema(note="", tool_to_call=None,
+                    stage_report=f"(model call failed: {type(e).__name__}: {e})"), {})
+        usage = CodeReviewOrchestrator._usage_from(resp)
         parsed = resp.get("parsed") if isinstance(resp, dict) else resp
         if parsed is not None:
-            return parsed
+            return parsed, usage
         # Grammar parse returned nothing — recover the JSON from the raw text.
         raw = resp.get("raw") if isinstance(resp, dict) else None
         content = getattr(raw, "content", "") if raw is not None else ""
@@ -412,12 +436,12 @@ class CodeReviewOrchestrator:
         data = _extract_json(content)
         if data is not None:
             try:
-                return AgentTurnSchema.model_validate(data)
+                return AgentTurnSchema.model_validate(data), usage
             except Exception:  # noqa: BLE001
                 pass
         # Give up cleanly: end the stage using whatever text we got as the report.
-        return AgentTurnSchema(note="", tool_to_call=None,
-                               stage_report=(content or "").strip() or "(no output)")
+        return (AgentTurnSchema(note="", tool_to_call=None,
+                stage_report=(content or "").strip() or "(no output)"), usage)
 
     # ── tool dispatch (manual, with injected state/tool_call_id) ─────────────
     @staticmethod

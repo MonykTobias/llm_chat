@@ -96,10 +96,10 @@ AGENTS: dict[str, BaseAgent] = {
         _cfg["agents"], template, name=role, **_BUILD_OPTS
     )
     for role, template in _cfg["prompt"].items()
-    if role != "cr_review"
+    if role != "code-assistant"
 }
 
-# cr_review is not a prompt-backed BaseAgent: it is an orchestrator graph that
+# code-assistant is not a prompt-backed BaseAgent: it is an orchestrator graph that
 # drives the four stage agents. It needs them already built, so it is wired AFTER
 # the comprehension with direct references (no lazy lookup, no import cycle). Its
 # config.yaml `prompt:` entry exists only so the UI lists the role.
@@ -109,7 +109,7 @@ from agents.sub_agents.code_review.orchestrator import (  # noqa: E402
     STAGE_ROLES,
 )
 
-AGENTS["cr_review"] = CodeReviewOrchestrator(
+AGENTS["code-assistant"] = CodeReviewOrchestrator(
     _cfg["agents"],
     stage_agents={stage: AGENTS[role] for stage, role in STAGE_ROLES.items()},
     checkpointer=_checkpointer,

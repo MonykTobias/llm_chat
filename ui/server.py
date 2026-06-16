@@ -426,6 +426,14 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
             cur_text.clear()
 
     last_usage: dict | None = None
+    # The code-assistant orchestrator hides its internal model calls from the native
+    # "messages" token stream, so it reports each call's usage on the custom
+    # channel instead. Aggregate it here: sum output tokens (real generation
+    # throughput across all four stages) and keep the peak input (how full the
+    # context got) so tok/s and the context-window bar work for that role too.
+    orch_out_tokens = 0
+    orch_peak_input = 0
+    orch_usage_seen = False
     active_tools: set[str] = set()
     # Accumulate streamed tool-call args (they arrive as JSON fragments) so we
     # can report which file/directory a tool touched once it completes.
@@ -433,7 +441,7 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
     tool_index_by_id: dict[str, int] = {}  # tool_call id  -> index
     tool_index_by_name: dict[str, int] = {}  # tool name    -> latest index
 
-    # Shared emit helpers so native streaming (below) and the cr_review
+    # Shared emit helpers so native streaming (below) and the code-assistant
     # orchestrator's "custom" channel produce identical token/tool SSE events and
     # transcript `parts`.
     def emit_text(text: str) -> None:
@@ -462,7 +470,7 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
         # Keep a handle on the generator so we can close() it promptly on cancel,
         # which sends GeneratorExit into the graph and stops it advancing.
         # "messages" carries native LLM tokens/tool calls; "custom" carries the
-        # cr_review orchestrator's per-stage progress (its own grammar-constrained
+        # code-assistant orchestrator's per-stage progress (its own grammar-constrained
         # JSON messages are suppressed below so they never reach the UI raw).
         stream = agent.stream(payload, config=config,
                               stream_mode=["messages", "custom"])
@@ -485,7 +493,7 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                     elif kind == "tool_end":
                         emit_tool_end(data.get("name", "tool"), data.get("target"))
                     elif kind == "stage":
-                        # The cr_review orchestrator switched to a new pipeline
+                        # The code-assistant orchestrator switched to a new pipeline
                         # stage. End the current text segment, record the handoff
                         # so it re-renders, and push a dedicated stage bubble.
                         flush_text()
@@ -493,6 +501,15 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                         parts.append({"type": "stage", "label": label})
                         emit({"type": "stage", "label": label,
                               "stage": data.get("stage")})
+                    elif kind == "usage":
+                        # One orchestrator model call's token usage. Sum the output
+                        # (throughput) and track the peak input (context fill) so the
+                        # done event below can drive the meters like a native turn.
+                        u = data.get("usage") or {}
+                        orch_usage_seen = True
+                        orch_out_tokens += int(u.get("output_tokens", 0) or 0)
+                        orch_peak_input = max(
+                            orch_peak_input, int(u.get("input_tokens", 0) or 0))
                 continue
 
             chunk, _meta = data
@@ -575,11 +592,19 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
         except Exception:  # noqa: BLE001
             pass
 
-        usage = {
-            "input_tokens": (last_usage or {}).get("input_tokens", 0),
-            "output_tokens": (last_usage or {}).get("output_tokens", 0),
-            "total_tokens": (last_usage or {}).get("total_tokens", 0),
-        }
+        if orch_usage_seen:
+            # code-assistant pipeline: peak context fill + summed generation.
+            usage = {
+                "input_tokens": orch_peak_input,
+                "output_tokens": orch_out_tokens,
+                "total_tokens": orch_peak_input + orch_out_tokens,
+            }
+        else:
+            usage = {
+                "input_tokens": (last_usage or {}).get("input_tokens", 0),
+                "output_tokens": (last_usage or {}).get("output_tokens", 0),
+                "total_tokens": (last_usage or {}).get("total_tokens", 0),
+            }
 
         # Persist transcript + stats
         ts = _now_iso()
