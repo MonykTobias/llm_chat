@@ -8,73 +8,64 @@
   <script>
     if (localStorage.getItem('theme') === 'light') document.documentElement.classList.remove('dark');
   </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { darkMode: 'class' }</script>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
-<body class="bg-gray-50 dark:bg-slate-950 text-gray-900 dark:text-slate-100 font-sans antialiased">
+<body class="antialiased">
   <div id="app" class="flex h-screen overflow-hidden">
 
     <!-- ── Left Sidebar ───────────────────────────────────────────── -->
-    <aside id="sidebar" class="w-72 flex-shrink-0 flex flex-col bg-white dark:bg-slate-900 border-r border-gray-200 dark:border-slate-700/60 overflow-hidden">
+    <aside id="sidebar" class="panel-l w-72 flex-shrink-0 flex flex-col overflow-hidden">
 
       <!-- Brand -->
       <div class="flex items-center gap-2.5 px-4 pt-5 pb-4 flex-shrink-0">
-        <span class="w-3 h-3 rounded-full bg-emerald-400 shadow-[0_0_10px_#34d399]"></span>
-        <h1 class="text-[15px] font-bold tracking-tight">Code Review</h1>
+        <span class="brand-logo">◳</span>
+        <div class="leading-tight">
+          <h1 class="text-[15px] font-bold tracking-tight">Code Review</h1>
+          <p class="text-[11px]" style="color:var(--text-faint)">AI review agent</p>
+        </div>
       </div>
 
       <!-- New Session form -->
       <div class="px-4 flex-shrink-0">
-        <h2 class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500 mb-3">New session</h2>
+        <h2 class="section-label mb-3">New session</h2>
 
-        <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Type</label>
-        <div id="mode-toggle" class="flex gap-1.5 mb-3 p-0.5 rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700">
-          <button type="button" data-mode="project"
-            class="mode-btn flex-1 px-2.5 py-1.5 text-sm rounded-md font-medium transition-colors">Project</button>
-          <button type="button" data-mode="chat"
-            class="mode-btn flex-1 px-2.5 py-1.5 text-sm rounded-md font-medium transition-colors">Chat</button>
+        <label class="field-label block mb-1">Type</label>
+        <div id="mode-toggle" class="seg mb-3">
+          <button type="button" data-mode="project" class="seg-btn mode-btn">Project</button>
+          <button type="button" data-mode="chat" class="seg-btn mode-btn">Chat</button>
         </div>
 
         <!-- Project-only fields: hidden in chat mode (no folder needed). -->
         <div id="project-fields">
-          <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Project path</label>
+          <label class="field-label block mb-1">Project path</label>
           <div class="flex gap-1.5 mb-3">
-            <input id="path-input" type="text" placeholder="C:\path\to\project"
-              class="flex-1 min-w-0 px-2.5 py-2 text-sm rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 placeholder-gray-400 dark:placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors" />
-            <button id="browse-btn" title="Browse with File Explorer"
-              class="px-3 py-2 rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-300 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors">
-              📁
-            </button>
+            <input id="path-input" type="text" placeholder="C:\path\to\project" class="field flex-1 min-w-0" />
+            <button id="browse-btn" title="Browse with File Explorer" class="icon-btn">📁</button>
           </div>
 
-          <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Language</label>
-          <select id="language-select"
-            class="w-full px-2.5 py-2 text-sm rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 mb-3">
-          </select>
+          <label class="field-label block mb-1">Language</label>
+          <select id="language-select" class="field mb-3"></select>
         </div>
 
-        <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Model</label>
-        <select id="model-select"
-          class="w-full px-2.5 py-2 text-sm rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 mb-3">
-        </select>
+        <label class="field-label block mb-1">Model</label>
+        <select id="model-select" class="field mb-3"></select>
 
-        <label class="block text-xs text-gray-500 dark:text-slate-400 mb-1">Role</label>
-        <select id="role-select"
-          class="w-full px-2.5 py-2 text-sm rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 mb-3">
-        </select>
+        <label class="field-label block mb-1">Role</label>
+        <select id="role-select" class="field mb-3"></select>
 
-        <button id="start-btn"
-          class="w-full py-2.5 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-          Start review
-        </button>
-        <p id="new-session-error" class="text-red-400 text-xs mt-2 min-h-4"></p>
+        <button id="start-btn" class="btn btn-primary w-full">Start review</button>
+        <p id="new-session-error" class="text-xs mt-2 min-h-4" style="color:var(--danger)"></p>
       </div>
 
       <!-- Session List -->
-      <div class="flex-1 min-h-0 flex flex-col px-4 pb-4 mt-3">
-        <h2 class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500 mb-2.5 flex-shrink-0">Sessions</h2>
-        <ul id="session-list" class="flex flex-col gap-1.5 overflow-y-auto flex-1"></ul>
+      <div class="flex-1 min-h-0 flex flex-col px-4 pb-4 mt-4">
+        <h2 class="section-label mb-2.5 flex-shrink-0">Sessions</h2>
+        <ul id="session-list" class="flex flex-col gap-1 overflow-y-auto flex-1 -mx-1 px-1"></ul>
       </div>
     </aside>
 
@@ -82,125 +73,104 @@
     <main id="chat-pane" class="relative flex-1 flex flex-col min-w-0">
 
       <!-- Drag-and-drop overlay (shown while files are dragged over the pane) -->
-      <div id="drop-overlay" class="hidden absolute inset-0 z-20 flex items-center justify-center bg-blue-500/15 backdrop-blur-sm border-2 border-dashed border-blue-500 rounded-lg pointer-events-none">
+      <div id="drop-overlay" class="drop-overlay hidden absolute inset-3 z-20 flex items-center justify-center pointer-events-none">
         <div class="text-center">
           <div class="text-4xl mb-2">📎</div>
-          <p class="text-base font-semibold text-blue-700 dark:text-blue-300">Drop files to attach</p>
-          <p class="text-xs text-blue-600/80 dark:text-blue-400/80 mt-1">images, PDFs, code &amp; text files</p>
+          <p class="text-base font-semibold" style="color:var(--accent)">Drop files to attach</p>
+          <p class="text-xs mt-1" style="color:var(--text-muted)">images, PDFs, code &amp; text files</p>
         </div>
       </div>
 
       <!-- Header -->
-      <header id="chat-header" class="flex items-center gap-2.5 px-4 py-3 bg-white dark:bg-slate-900 border-b border-gray-200 dark:border-slate-700/60 flex-shrink-0">
-        <button id="toggle-sidebar" title="Show / hide the sessions panel"
-          class="icon-btn flex-none w-8 h-8 flex items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-400 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-sm">
-          ☰
-        </button>
+      <header id="chat-header" class="bar-top flex items-center gap-2 px-4 py-3 flex-shrink-0">
+        <button id="toggle-sidebar" title="Show / hide the sessions panel" class="icon-btn">☰</button>
         <div class="flex-1 min-w-0">
           <h2 id="chat-title" class="text-sm font-semibold truncate">No session selected</h2>
-          <p id="chat-subtitle" class="text-xs text-gray-500 dark:text-slate-400 truncate mt-0.5">Create a session on the left to begin.</p>
+          <p id="chat-subtitle" class="text-xs truncate mt-0.5" style="color:var(--text-muted)">Create a session on the left to begin.</p>
         </div>
-        <span id="restored-badge" class="hidden text-xs px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800 whitespace-nowrap font-medium">
-          restored
-        </span>
-        <select id="role-switch" title="Switch the agent's role for the next message" class="hidden text-xs bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-800 dark:text-slate-100 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500"></select>
-        <select id="model-switch" title="Switch the model for the next message" class="hidden text-xs bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-800 dark:text-slate-100 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500"></select>
-        <select id="language-switch" title="Switch the language for the next message" class="hidden text-xs bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-800 dark:text-slate-100 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500"></select>
-        <button id="theme-toggle" title="Toggle light / dark mode"
-          class="icon-btn flex-none w-8 h-8 flex items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-400 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-sm">
-          🌙
-        </button>
-        <button id="toggle-stats" title="Show / hide the live stats panel"
-          class="icon-btn flex-none w-8 h-8 flex items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-400 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-sm">
-          📊
-        </button>
+        <span id="restored-badge" class="badge-amber hidden">restored</span>
+        <select id="role-switch" title="Switch the agent's role for the next message" class="pill-select hidden"></select>
+        <select id="model-switch" title="Switch the model for the next message" class="pill-select hidden"></select>
+        <select id="language-switch" title="Switch the language for the next message" class="pill-select hidden"></select>
+        <button id="theme-toggle" title="Toggle light / dark mode" class="icon-btn">🌙</button>
+        <button id="toggle-stats" title="Show / hide the live stats panel" class="icon-btn">📊</button>
       </header>
 
       <!-- Messages -->
-      <div id="messages" class="flex-1 overflow-y-auto px-6 py-5 flex flex-col gap-4"></div>
+      <div id="messages" class="flex-1 overflow-y-auto px-6 py-6 flex flex-col gap-4"></div>
 
       <!-- Composer -->
-      <div id="composer" class="border-t border-gray-200 dark:border-slate-700/60 px-4 py-3 bg-white dark:bg-slate-900 flex-shrink-0">
-        <div id="queue-indicator" class="hidden text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900/60 rounded-lg px-3 py-2 mb-2.5"></div>
+      <div id="composer" class="bar-bottom px-4 py-3 flex-shrink-0">
+        <div id="queue-indicator" class="queue-box hidden mb-2.5"></div>
         <!-- Pending attachments for the next message (drag-drop / paste / picker) -->
         <div id="attachment-preview" class="hidden flex flex-wrap gap-2 mb-2.5"></div>
-        <div class="flex gap-2.5 items-end">
+        <div class="flex gap-2 items-end">
           <input id="file-input" type="file" multiple class="hidden" />
-          <button id="attach-btn" title="Attach files (or drag &amp; drop / paste)"
-            class="flex-none w-10 h-10 flex items-center justify-center rounded-xl bg-gray-100 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 text-gray-600 dark:text-slate-300 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors text-base disabled:opacity-50 disabled:cursor-not-allowed">
-            📎
-          </button>
-          <textarea id="message-input" rows="1" placeholder="Ask a follow-up question…"
-            class="flex-1 resize-none max-h-40 px-3 py-2.5 rounded-xl border border-gray-200 dark:border-slate-700 bg-gray-100 dark:bg-slate-800 text-gray-900 dark:text-slate-100 placeholder-gray-400 dark:placeholder-slate-500 text-sm font-[inherit] leading-relaxed focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"></textarea>
-          <button id="send-btn"
-            class="flex-none px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-            Send
-          </button>
-          <button id="stop-btn" title="Stop the agent"
-            class="hidden flex-none px-5 py-2.5 rounded-xl bg-red-600 hover:bg-red-500 text-white font-semibold text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-            Stop
-          </button>
+          <button id="attach-btn" title="Attach files (or drag &amp; drop / paste)" class="icon-btn w-10 h-10 text-base">📎</button>
+          <textarea id="message-input" rows="1" placeholder="Ask a follow-up question…" class="composer-input"></textarea>
+          <button id="send-btn" class="btn btn-primary">Send</button>
+          <button id="stop-btn" title="Stop the agent" class="btn btn-danger hidden">Stop</button>
         </div>
-        <p class="text-xs text-gray-400 dark:text-slate-500 mt-2">Enter to send · Shift+Enter for newline · drag, paste or 📎 to attach files · follow-ups queue while the agent is working</p>
+        <p class="composer-hint">Enter to send · Shift+Enter for newline · drag, paste or 📎 to attach files · follow-ups queue while the agent is working</p>
       </div>
     </main>
 
     <!-- ── Stats Pane ──────────────────────────────────────────────── -->
-    <aside id="stats-pane" class="w-72 flex-shrink-0 flex flex-col gap-3 p-4 bg-white dark:bg-slate-900 border-l border-gray-200 dark:border-slate-700/60 overflow-y-auto">
+    <aside id="stats-pane" class="panel-r w-72 flex-shrink-0 flex flex-col gap-3 p-4 overflow-y-auto">
 
-      <h2 class="text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500">Live stats</h2>
+      <h2 class="section-label">Live stats</h2>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Status</div>
+      <div class="stat-card">
+        <div class="stat-cap mb-1.5">Status</div>
         <div id="stat-status" class="stat-status idle font-semibold text-sm">Idle</div>
       </div>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-2">Tools <span class="normal-case tracking-normal text-gray-400 dark:text-slate-500">· applies to next message</span></div>
+      <div class="stat-card">
+        <div class="stat-cap mb-2">Tools <span style="text-transform:none;letter-spacing:normal;color:var(--text-faint)">· applies to next message</span></div>
         <ul id="tool-toggles" class="flex flex-col gap-1.5 text-xs">
-          <li class="muted text-gray-400 dark:text-slate-500">no session</li>
+          <li class="muted">no session</li>
         </ul>
       </div>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Response time</div>
-        <div id="stat-timer" class="text-3xl font-bold tabular-nums leading-none">0.0s</div>
-        <div id="stat-timer-sub" class="text-xs text-gray-400 dark:text-slate-500 mt-1.5">last turn: —</div>
+      <div class="stat-card">
+        <div class="stat-cap mb-1.5">Response time</div>
+        <div id="stat-timer" class="stat-big tabular-nums">0.0s</div>
+        <div id="stat-timer-sub" class="stat-sub">last turn: —</div>
       </div>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Speed</div>
-        <div id="stat-speed" class="text-3xl font-bold tabular-nums leading-none">— <span class="unit">tok/s</span></div>
-        <div id="stat-speed-sub" class="text-xs text-gray-400 dark:text-slate-500 mt-1.5">output tokens / sec</div>
+      <div class="stat-card">
+        <div class="stat-cap mb-1.5">Speed</div>
+        <div id="stat-speed" class="stat-big tabular-nums">— <span class="unit">tok/s</span></div>
+        <div id="stat-speed-sub" class="stat-sub">output tokens / sec</div>
       </div>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-1.5">Context window usage</div>
-        <div class="h-2 bg-gray-200 dark:bg-slate-900/80 rounded-full overflow-hidden border border-gray-300 dark:border-slate-700 mt-2 mb-1.5">
-          <div id="ctx-bar" class="h-full w-0 bg-gradient-to-r from-emerald-500 to-amber-400 transition-all duration-300 rounded-full"></div>
+      <div class="stat-card">
+        <div class="stat-cap mb-1.5">Context window usage</div>
+        <div class="ctx-track mt-2 mb-1.5">
+          <div id="ctx-bar" class="ctx-fill"></div>
         </div>
-        <div id="ctx-text" class="text-xs text-gray-400 dark:text-slate-500">— / —</div>
+        <div id="ctx-text" class="stat-sub" style="margin-top:0">— / —</div>
       </div>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-2">Last turn tokens</div>
-        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Input</span><b id="tok-in" class="tabular-nums">0</b></div>
-        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Output</span><b id="tok-out" class="tabular-nums">0</b></div>
-        <div class="flex justify-between text-sm py-0.5 border-t border-gray-200 dark:border-slate-700/50 mt-1 pt-1.5"><span class="text-gray-500 dark:text-slate-400">Total</span><b id="tok-total" class="tabular-nums">0</b></div>
+      <div class="stat-card">
+        <div class="stat-cap mb-2">Last turn tokens</div>
+        <div class="stat-row"><span>Input</span><b id="tok-in" class="tabular-nums">0</b></div>
+        <div class="stat-row"><span>Output</span><b id="tok-out" class="tabular-nums">0</b></div>
+        <div class="stat-row total"><span>Total</span><b id="tok-total" class="tabular-nums">0</b></div>
       </div>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-2">Session totals</div>
-        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Turns</span><b id="tot-turns" class="tabular-nums">0</b></div>
-        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Input</span><b id="tot-in" class="tabular-nums">0</b></div>
-        <div class="flex justify-between text-sm py-0.5"><span class="text-gray-500 dark:text-slate-400">Output</span><b id="tot-out" class="tabular-nums">0</b></div>
-        <div class="flex justify-between text-sm py-0.5 border-t border-gray-200 dark:border-slate-700/50 mt-1 pt-1.5"><span class="text-gray-500 dark:text-slate-400">Total</span><b id="tot-total" class="tabular-nums">0</b></div>
+      <div class="stat-card">
+        <div class="stat-cap mb-2">Session totals</div>
+        <div class="stat-row"><span>Turns</span><b id="tot-turns" class="tabular-nums">0</b></div>
+        <div class="stat-row"><span>Input</span><b id="tot-in" class="tabular-nums">0</b></div>
+        <div class="stat-row"><span>Output</span><b id="tot-out" class="tabular-nums">0</b></div>
+        <div class="stat-row total"><span>Total</span><b id="tot-total" class="tabular-nums">0</b></div>
       </div>
 
-      <div class="bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700/50 rounded-xl p-3">
-        <div class="text-[10px] uppercase tracking-wider font-medium text-gray-400 dark:text-slate-500 mb-2">Tool activity</div>
+      <div class="stat-card">
+        <div class="stat-cap mb-2">Tool activity</div>
         <ul id="tool-activity" class="flex flex-col gap-1 text-xs max-h-40 overflow-y-auto">
-          <li class="muted text-gray-400 dark:text-slate-500">none yet</li>
+          <li class="muted">none yet</li>
         </ul>
       </div>
     </aside>

@@ -257,9 +257,7 @@ function renderAttachments() {
   if (!state.attachments.length) { box.classList.add("hidden"); return; }
   box.classList.remove("hidden");
   state.attachments.forEach((a, i) => {
-    const chip = el("div",
-      "flex items-center gap-1.5 text-xs pl-1.5 pr-1 py-1 rounded-lg bg-gray-100 dark:bg-slate-800 " +
-      "border border-gray-200 dark:border-slate-700 text-gray-700 dark:text-slate-200");
+    const chip = el("div", "chip");
     if ((a.type || "").startsWith("image/") && a.data) {
       const img = el("img", "w-7 h-7 object-cover rounded");
       img.src = a.data;
@@ -268,9 +266,7 @@ function renderAttachments() {
       chip.appendChild(el("span", "text-base", fileIcon(a.type, a.name)));
     }
     chip.appendChild(el("span", "font-mono truncate max-w-[140px]", a.name));
-    const x = el("button",
-      "flex-none w-5 h-5 flex items-center justify-center rounded text-gray-400 hover:text-red-500 hover:bg-red-500/10 transition-colors",
-      "✕");
+    const x = el("button", "chip-x", "✕");
     x.title = "Remove";
     x.addEventListener("click", () => removeAttachment(i));
     chip.appendChild(x);
@@ -348,23 +344,17 @@ function renderSessionList() {
   ul.innerHTML = "";
   for (const s of state.sessions) {
     const active = s.id === state.activeId;
-    const li = el("li",
-      "group flex items-center gap-1.5 px-2.5 py-2 rounded-lg border transition-colors cursor-pointer " +
-      (active
-        ? "bg-blue-50 dark:bg-blue-950/40 border-blue-400 dark:border-blue-600"
-        : "bg-gray-50 dark:bg-slate-800 border-transparent hover:border-gray-300 dark:hover:border-slate-600"));
+    const li = el("li", "session-item" + (active ? " active" : ""));
 
     const info = el("div", "flex-1 min-w-0");
-    info.appendChild(el("div", "text-sm font-semibold truncate", s.title));
+    info.appendChild(el("div", "session-title truncate", s.title));
     const label = (s.mode || "project") === "chat" ? "chat" : s.language;
     const meta = `${label} · ${fmtTime(s.created)}`;
-    info.appendChild(el("div", "text-[11px] text-gray-400 dark:text-slate-500 mt-0.5 truncate",
+    info.appendChild(el("div", "session-meta truncate",
       meta + (s.restored ? " · restored" : "")));
     info.addEventListener("click", () => selectSession(s.id));
 
-    const del = el("button",
-      "flex-none text-xs px-1.5 py-1 rounded-md text-gray-400 dark:text-slate-500 opacity-0 group-hover:opacity-100 hover:text-red-500 hover:bg-red-500/10 transition-all",
-      "✕");
+    const del = el("button", "session-del", "✕");
     del.title = "Delete this session";
     del.addEventListener("click", (e) => { e.stopPropagation(); deleteSession(s.id); });
 
@@ -487,7 +477,7 @@ function renderTools(s) {
   ul.innerHTML = "";
   const tools = (s && state.toolsByRole[s.role]) || [];
   if (!s || !tools.length) {
-    ul.innerHTML = '<li class="muted text-gray-400 dark:text-slate-500">no session</li>';
+    ul.innerHTML = '<li class="muted">no session</li>';
     return;
   }
   const enabled = new Set(s.enabled_tools || tools);
@@ -497,7 +487,7 @@ function renderTools(s) {
     cb.type = "checkbox";
     cb.id = "tool-cb-" + name;
     cb.checked = enabled.has(name);
-    cb.className = "accent-blue-600 cursor-pointer";
+    cb.className = "cursor-pointer";
     cb.addEventListener("change", () => toggleTool(name, cb.checked));
     const label = el("label", "cursor-pointer select-none font-mono text-[11px] truncate", name);
     label.htmlFor = cb.id;
@@ -656,10 +646,7 @@ async function onStop() {
 }
 
 // ── Message rendering ──────────────────────────────────────────────────
-const AI_BUBBLE_CLS =
-  "ai-bubble px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-gray-100 dark:bg-slate-800 " +
-  "border border-gray-200 dark:border-slate-700 text-gray-900 dark:text-slate-100 " +
-  "text-sm leading-relaxed break-words";
+const AI_BUBBLE_CLS = "ai-bubble bubble-ai";
 
 // The "time · 4.2s · 1,234 tok · 18.3 tok/s" line shown under an assistant turn.
 function bubbleMetaText(role, ts, meta) {
@@ -698,12 +685,14 @@ function addStageDivider(nextMode) {
 // text bubbles and tool pills so the stage hand-off is unmistakable in the chat.
 function addStageBanner(label) {
   const wrap = el("div", "self-center my-3 flex items-center gap-2 w-full max-w-[80%]");
-  wrap.appendChild(el("div", "flex-1 h-px bg-gray-200 dark:bg-slate-700"));
-  wrap.appendChild(el("div",
-    "px-3 py-1 rounded-full text-xs font-semibold bg-indigo-100 text-indigo-700 " +
-    "dark:bg-indigo-900/50 dark:text-indigo-300 border border-indigo-200 " +
-    "dark:border-indigo-800 whitespace-nowrap", label));
-  wrap.appendChild(el("div", "flex-1 h-px bg-gray-200 dark:bg-slate-700"));
+  const line = () => { const d = el("div", "flex-1"); d.style.height = "1px"; d.style.background = "var(--border)"; return d; };
+  wrap.appendChild(line());
+  const tag = el("div", "px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap", label);
+  tag.style.color = "var(--accent)";
+  tag.style.background = "var(--accent-soft)";
+  tag.style.border = "1px solid color-mix(in srgb, var(--accent) 35%, transparent)";
+  wrap.appendChild(tag);
+  wrap.appendChild(line());
   $("messages").appendChild(wrap);
   scrollMessages();
 }
@@ -721,10 +710,7 @@ function addMessageBubble(role, content, ts, meta) {
     wrap.appendChild(row);
   }
 
-  const bubble = el("div",
-    isUser
-      ? "px-3.5 py-2.5 rounded-2xl rounded-br-sm bg-blue-600 text-white text-sm leading-relaxed whitespace-pre-wrap break-words"
-      : AI_BUBBLE_CLS);
+  const bubble = el("div", isUser ? "bubble-user" : AI_BUBBLE_CLS);
 
   if (role === "assistant" && content) {
     bubble.innerHTML = marked.parse(content);
@@ -734,8 +720,7 @@ function addMessageBubble(role, content, ts, meta) {
 
   // Skip an empty bubble when a user message carries only attachments.
   if (content || !isUser || !atts.length) wrap.appendChild(bubble);
-  wrap.appendChild(el("div", "text-[11px] text-gray-400 dark:text-slate-500",
-    bubbleMetaText(role, ts, meta)));
+  wrap.appendChild(el("div", "bubble-meta", bubbleMetaText(role, ts, meta)));
   $("messages").appendChild(wrap);
   return bubble;
 }
@@ -759,8 +744,7 @@ function renderAssistantTurn(m) {
       lastWrap = null;  // a footer should never hang off a stage banner
     }
   }
-  const footer = el("div", "text-[11px] text-gray-400 dark:text-slate-500",
-    bubbleMetaText("assistant", m.ts, m));
+  const footer = el("div", "bubble-meta", bubbleMetaText("assistant", m.ts, m));
   if (lastWrap) {
     lastWrap.appendChild(footer);
   } else {
@@ -781,9 +765,7 @@ function attachmentThumb(a) {
     img.title = a.name;
     return img;
   }
-  const pill = el("div",
-    "flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg bg-blue-50 dark:bg-blue-950/40 " +
-    "border border-blue-200 dark:border-blue-800/60 text-blue-700 dark:text-blue-300");
+  const pill = el("div", "chip");
   pill.appendChild(el("span", "text-base", fileIcon(a.type, a.name)));
   pill.appendChild(el("span", "font-mono truncate max-w-[180px]", a.name));
   pill.title = a.name;
@@ -833,16 +815,11 @@ function renderQueue() {
   state.queue.forEach((m, i) => {
     const label = m.text || `📎 ${m.attachments.length} file(s)`;
     const short = label.length > 40 ? label.slice(0, 40) + "…" : label;
-    const chip = el("div",
-      "flex items-center gap-1.5 pl-2 pr-1 py-0.5 rounded-lg bg-blue-100/60 dark:bg-blue-900/40 " +
-      "border border-blue-200 dark:border-blue-800/60");
+    const chip = el("div", "queue-chip text-xs");
     const txt = el("span", "truncate max-w-[220px]", `"${short}"`);
     txt.title = label;
     chip.appendChild(txt);
-    const x = el("button",
-      "flex-none w-4 h-4 flex items-center justify-center rounded text-blue-400 " +
-      "hover:text-red-500 hover:bg-red-500/10 transition-colors",
-      "✕");
+    const x = el("button", "chip-x", "✕");
     x.title = "Remove from queue";
     x.addEventListener("click", () => removeQueued(i));
     chip.appendChild(x);
@@ -1202,7 +1179,7 @@ function resetStats() {
 const toolNodes = {};
 function clearTools() {
   for (const k in toolNodes) delete toolNodes[k];
-  $("tool-activity").innerHTML = '<li class="muted text-gray-400 dark:text-slate-500">none yet</li>';
+  $("tool-activity").innerHTML = '<li class="muted">none yet</li>';
 }
 function updateTool(name, phase) {
   const list = $("tool-activity");
@@ -1210,9 +1187,9 @@ function updateTool(name, phase) {
   let li = toolNodes[name];
   if (!li) { li = el("li", "flex items-center gap-1.5"); toolNodes[name] = li; list.appendChild(li); }
   if (phase === "start") {
-    li.innerHTML = `<span class="text-blue-500 animate-spin inline-block">⟳</span> ${name}`;
+    li.innerHTML = `<span class="animate-spin inline-block" style="color:var(--accent)">⟳</span> ${name}`;
   } else {
-    li.innerHTML = `<span class="text-emerald-500">✓</span> ${name}`;
+    li.innerHTML = `<span style="color:var(--ok)">✓</span> ${name}`;
   }
 }
 
