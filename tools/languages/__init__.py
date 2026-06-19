@@ -16,6 +16,8 @@ clear "not configured" message rather than an error.
 """
 from __future__ import annotations
 
+from structured_output import CompileOutput
+
 from . import go, java, javascript, python, rust
 
 # language name -> handler module exposing run_linter / run_tests /
@@ -38,26 +40,51 @@ def _unknown(language: str, kind: str) -> str:
 def run_linter(path: str, language: str) -> str:
     handler = _HANDLERS.get(language)
     if handler is None:
-        return _unknown(language, "linter")
-    return handler.run_linter(path, language)
+        answer = _unknown(language, "linter")
+        return answer
+    answer = handler.run_linter(path, language)
+    return answer
 
 
 def run_tests(path: str, language: str, include_coverage: bool = True) -> str:
     handler = _HANDLERS.get(language)
     if handler is None:
-        return _unknown(language, "test runner")
-    return handler.run_tests(path, language, include_coverage)
+        answer = _unknown(language, "test runner")
+        return answer
+    answer = handler.run_tests(path, language, include_coverage)
+    return answer
 
 
 def run_type_check(path: str, language: str) -> str:
     handler = _HANDLERS.get(language)
     if handler is None:
-        return _unknown(language, "type checker")
-    return handler.run_type_check(path, language)
+        answer = _unknown(language, "type checker")
+        return answer
+    answer = handler.run_type_check(path, language)
+    return answer
 
 
 def check_imports(path: str, language: str) -> str:
     handler = _HANDLERS.get(language)
     if handler is None:
-        return _unknown(language, "import checker")
-    return handler.check_imports(path, language)
+        answer: str = _unknown(language, "import checker")
+        return answer
+    answer = handler.check_imports(path, language)
+    return answer
+
+
+def compile_code(path: str, language: str) -> CompileOutput:
+    """Compile the project in an ephemeral Docker container; return a CompileOutput.
+
+    Non-code / unsupported languages (e.g. "english") get a `status="unavailable"`
+    result carrying the not-configured note, mirroring the string dispatchers above.
+    """
+    handler = _HANDLERS.get(language)
+    if handler is None:
+        answer = CompileOutput(
+            status="unavailable", language=language, compiler="",
+            exit_code=-1, errors=[], warnings=[_unknown(language, "compiler")],
+            duration_ms=0)
+        return answer
+    answer = handler.compile_code(path, language)
+    return answer

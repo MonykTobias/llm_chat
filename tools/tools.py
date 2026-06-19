@@ -25,10 +25,17 @@ from .filesystem import (
     list_all_files,
     read_file,
     write_file,
+    # Programmatic (non-LLM) helpers used directly by the orchestrator graph nodes,
+    # so file ops never depend on the model picking the right tool.
+    safe_read,
+    safe_write,
+    safe_delete,
+    list_workspace_files,
 )
 from .language import (
     analyze_architecture,
     check_imports,
+    compile_code,
     run_linter,
     run_tests,
     run_type_check,
@@ -44,12 +51,18 @@ __all__ = [
     "write_file",
     "delete_file",
     "list_all_files",
+    # filesystem — programmatic helpers (graph nodes)
+    "safe_read",
+    "safe_write",
+    "safe_delete",
+    "list_workspace_files",
     # language tooling
     "run_linter",
     "run_tests",
     "run_type_check",
     "analyze_architecture",
     "check_imports",
+    "compile_code",
     # change tracking
     "build_change_report",
     "restore_snapshot",

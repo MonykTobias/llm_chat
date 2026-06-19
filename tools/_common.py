@@ -6,8 +6,11 @@ web, change_tracking) can depend on them without depending on each other.
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
+
+from langgraph.config import get_stream_writer
 
 _IGNORE = {"__pycache__", "node_modules", ".git", ".venv", "venv",
            ".idea", ".mypy_cache", ".pytest_cache", "dist", "build"}
@@ -19,6 +22,14 @@ _IGNORE = {"__pycache__", "node_modules", ".git", ".venv", "venv",
 # holds the summary / failure count) and drop the middle.
 _TOOL_MAX_CHARS = 8_000
 
+from langgraph.config import get_stream_writer
+
+def _w(text: str) -> None:
+    try:
+        writer = get_stream_writer()
+        writer({"kind": "text", "text": text + "\n\n"})
+    except Exception:
+        pass  # outside streaming context — silently skip
 
 def _truncate(text: str, max_chars: int = _TOOL_MAX_CHARS) -> str:
     """Bound `text` to `max_chars`, keeping head + tail with a dropped-middle note."""

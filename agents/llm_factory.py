@@ -15,8 +15,24 @@ ChatOllama maps our per-agent config.yaml values straight onto the request:
 so each agent's configured context finally takes effect. Verify with `ollama ps`
 — the CONTEXT column should now match config.yaml.
 """
+import re
+
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_ollama import ChatOllama
 
+def _strip_thinking(content: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+class _StripThinkingCallback(BaseCallbackHandler):
+    """Strip <think>...</think> from LLM output before LangChain parses tool calls."""
+
+    def on_llm_end(self, response, **kwargs):
+        for generations in response.generations:
+            for gen in generations:
+                if hasattr(gen, "text"):
+                    gen.text = _strip_thinking(gen.text)
+                if hasattr(gen, "message") and isinstance(gen.message.content, str):
+                    gen.message.content = _strip_thinking(gen.message.content)
 
 def _native_base_url(base_url: str) -> str:
     """Strip the OpenAI-compat '/v1' suffix — ChatOllama uses the native API root."""
@@ -24,7 +40,6 @@ def _native_base_url(base_url: str) -> str:
     if url.endswith("/v1"):
         url = url[: -len("/v1")].rstrip("/")
     return url or "http://localhost:11434"
-
 
 def make_llm(cfg: dict) -> ChatOllama:
     """Build a ChatOllama from one `agents.<name>` section of config.yaml."""
@@ -45,6 +60,9 @@ def make_llm(cfg: dict) -> ChatOllama:
         else:
             # Qwen / binary models: just on/off
             kwargs["reasoning"] = True
+        # callbacks are handled by langchain (start/end of llm/tools)
+        kwargs["callbacks"] = [_StripThinkingCallback()]
+
     return ChatOllama(**kwargs)
 
 

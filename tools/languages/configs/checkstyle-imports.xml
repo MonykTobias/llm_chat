@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+
+<!--
+  Import-only Checkstyle config used by the Java check_imports tool (NOT the
+  linter). It carries just the import-hygiene checks so the UNUSED section of the
+  unified import report has no structural-lint noise.
+-->
+<module name="Checker">
+  <property name="severity" value="warning"/>
+
+  <module name="TreeWalker">
+    <module name="UnusedImports"/>
+    <module name="RedundantImport"/>
+  </module>
+</module>

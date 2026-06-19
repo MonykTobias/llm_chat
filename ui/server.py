@@ -47,7 +47,7 @@ os.chdir(PROJECT_ROOT)
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import agents  # noqa: E402  (after chdir/sys.path tweak, by design)
-from langchain_core.messages import AIMessageChunk, ToolMessage  # noqa: E402
+from langchain_core.messages import AIMessageChunk, ToolMessage, AIMessage  # noqa: E402
 from tools.tools import restore_snapshot  # noqa: E402  (revert button backend)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -67,7 +67,7 @@ print(MODELS)
 
 # Roles = the prompt "personalities" the user can switch between on the go
 # (code-review, explore, ...). Keys of config.yaml's `prompt:` map.
-ROLES = list(_cfg.get("prompt", {}))
+ROLES = agents.ROLES
 DEFAULT_ROLE = agents.DEFAULT_ROLE
 print(ROLES)
 
@@ -83,13 +83,26 @@ ROLE_REQUIRES_PROJECT = agents.ROLE_REQUIRES_PROJECT
 # Roles offered as the default for each mode (first matching role in config order).
 _DEFAULT_CHAT_ROLE = next((r for r in ROLES if not ROLE_REQUIRES_PROJECT.get(r, True)), None)
 
+# The orchestrator-graph role ("Coder" in the UI). It is a multi-node planner
+# driven entirely by graph_config.yaml (its own per-node models + prompts), so the
+# UI exposes it as its own mode with NO role/model pickers. An optional spec file
+# rides along into the graph's context_store as spec_content. See agents/__init__.py
+# (AGENTS["code-assistant"] = Orchestrator graph) for the wiring.
+CODER_ROLE = "code-assistant"
+# Model is config-driven for the coder graph; the value stored on the session only
+# feeds the stats meters (context-window bar). Prefer the build default model.
+_CODER_MODEL = "main_agent" if "main_agent" in MODELS else (MODELS[0] if MODELS else "")
+
 
 def _tools_for_role(role: str) -> list[str]:
     return list(TOOLS_BY_ROLE.get(role, TOOLS_BY_ROLE.get(DEFAULT_ROLE, [])))
 
 
 def _mode_for_role(role: str) -> str:
-    """'project' if the role needs a folder, else 'chat'."""
+    """'coder' for the orchestrator-graph role, 'project' if the role needs a
+    folder, else 'chat'."""
+    if role == CODER_ROLE:
+        return "coder"
     return "project" if ROLE_REQUIRES_PROJECT.get(role, True) else "chat"
 
 # ── session store (in-memory, mirrored to disk for re-reading) ──────────────
@@ -123,6 +136,7 @@ def _load_sessions() -> None:
                 s.setdefault("enabled_tools", _tools_for_role(s["role"]))
                 # Sessions saved before chat mode all had folders -> project.
                 s.setdefault("mode", _mode_for_role(s.get("role", DEFAULT_ROLE)))
+                s.setdefault("spec_content", "")  # added with coder mode
                 # If the SQLite checkpointer has state for this thread the session
                 # is fully resumable; otherwise the next message re-initialises it.
                 cfg = {"configurable": {"thread_id": s["id"]}}
@@ -144,7 +158,7 @@ def _save_sessions() -> None:
 
 
 def _new_session(path: str, language: str, model: str, role: str,
-                 mode: str = "project") -> dict:
+                 mode: str = "project", spec_content: str = "") -> dict:
     sid = uuid.uuid4().hex[:12]
     # Chat sessions have no folder, so fall back to a friendly default title.
     title = Path(path).name or path or ("Chat" if mode == "chat" else "session")
@@ -155,7 +169,10 @@ def _new_session(path: str, language: str, model: str, role: str,
         "language": language,
         "model": model,
         "role": role,
-        "mode": mode,            # 'chat' (folder-less) or 'project'
+        "mode": mode,            # 'chat' (folder-less), 'project', or 'coder'
+        # Optional spec/context text for the coder graph; fed into the graph's
+        # context_store as spec_content on the first turn (see _run_turn).
+        "spec_content": spec_content,
         "enabled_tools": _tools_for_role(role),  # all on by default
         "created": _now_iso(),
         "messages": [],          # [{role, content, ts, usage?, elapsed?}]
@@ -393,6 +410,13 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
             "project_path": session["path"],
             "model": session["model"],
         }
+        # Coder sessions may carry an optional spec file: seed the orchestrator
+        # graph's shared store so the scaffold and downstream agents can read it
+        # under context_store["spec_content"]. Only sent on the first turn — it is
+        # persisted in the checkpoint state thereafter (merge_dicts reducer).
+        spec = session.get("spec_content")
+        if spec:
+            payload["context_store"] = {"spec_content": spec}
         session["started"] = True
     else:
         payload = {"messages": [{"role": "user", "content": content}]}
@@ -453,7 +477,11 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
 
     def emit_tool_start(name: str, target: dict | None = None) -> None:
         if name in active_tools:
-            return
+            # A previous call to this tool never reported completion (its result
+            # was dropped, or a stage errored before the end event). Close it out
+            # now so its pill stops spinning AND this fresh call isn't suppressed
+            # — otherwise the stuck name permanently blocks every later call.
+            emit_tool_end(name)
         active_tools.add(name)
         flush_text()  # text before the tool call ends its own segment here
         emit({"type": "tool", "name": name, "phase": "start"})
@@ -513,19 +541,44 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                 continue
 
             chunk, _meta = data
-            # Drop the orchestrator stages' internal model/tool messages: they are
-            # grammar-constrained structured-output JSON, surfaced cleanly via the
-            # "custom" events above instead.
-            if (_meta or {}).get("langgraph_node") in agents.STAGE_NODE_NAMES:
+
+            # Orchestrator pipeline stages talk to the UI via the "custom" channel; their
+            # native LLM token stream is grammar-constrained JSON — drop it here.
+            is_graph_node = (_meta or {}).get("langgraph_node") in {
+                "scaffold", "orchestrator", "inspector", "architect", "coder",
+                "validator", "step_dispatch",
+            }
+
+            if is_graph_node:
+                # Only let tool-related chunks through — drop raw text content
+                is_tool_chunk = isinstance(chunk, AIMessageChunk) and bool(chunk.tool_call_chunks)
+                is_tool_result = isinstance(chunk, ToolMessage)
+                if not is_tool_chunk and not is_tool_result:
+                    continue
+            # Full AIMessage (non-streaming) with tool calls — graph nodes deliver these
+            # as complete messages rather than chunks, so register IDs here too.
+            if isinstance(chunk, AIMessage) and not isinstance(chunk, AIMessageChunk):
+                for tc in (chunk.tool_calls or []):
+                    name = tc.get("name", "")
+                    idx = len(tool_args)
+                    tool_index_by_id[tc.get("id", "")] = idx
+                    tool_index_by_name[name] = idx
+                    tool_args[idx] = json.dumps(tc.get("args", {}))
+                    emit_tool_start(name)
                 continue
 
             # Tool result coming back
             if isinstance(chunk, ToolMessage):
                 name = chunk.name or "tool"
-                idx = tool_index_by_id.get(getattr(chunk, "tool_call_id", None))
+                tool_call_id = getattr(chunk, "tool_call_id", None)
+                idx = tool_index_by_id.get(tool_call_id)
                 if idx is None:
                     idx = tool_index_by_name.get(name)
                 target = _extract_target(tool_args.get(idx, "")) if idx is not None else None
+                # Force-add to active_tools if it never got a start event
+                # (happens when the AIMessage arrived as a complete message, not chunks)
+                if name not in active_tools:
+                    emit_tool_start(name, target)
                 emit_tool_end(name, target)
                 continue
 
@@ -563,6 +616,10 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                     last_usage = chunk.usage_metadata
 
         flush_text()  # trailing text segment after the last tool (or whole answer)
+        # Any tool still marked active never produced an end event — close them
+        # out so no pill is left spinning once the turn (or a Stop) finishes.
+        for stuck in list(active_tools):
+            emit_tool_end(stuck)
         elapsed = round(time.monotonic() - started, 2)
         answer = "".join(answer_parts).strip()
 
@@ -720,17 +777,26 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/session":
             data = self._read_body()
             mode = (data.get("mode") or "project").strip().lower()
-            if mode not in ("project", "chat"):
+            if mode not in ("project", "chat", "coder"):
                 self._send_json({"error": f"unknown mode '{mode}'"}, 400)
                 return
             path = (data.get("path") or "").strip()
             language = (data.get("language") or "").strip().lower()
             model = (data.get("model") or "").strip().lower()
+            spec = data.get("spec")
+            spec = spec if isinstance(spec, str) else ""
             role = (data.get("role")
                     or (_DEFAULT_CHAT_ROLE if mode == "chat" else DEFAULT_ROLE)
                     or DEFAULT_ROLE).strip()
-            # Chat sessions are folder-less and default to English; project
-            # sessions still require a real path + language.
+            # Coder mode is driven entirely by graph_config.yaml: the role + model
+            # are fixed here (the UI offers no pickers for them), and an optional
+            # spec file rides along into the graph's context_store.
+            if mode == "coder":
+                role = CODER_ROLE
+                model = _CODER_MODEL
+                language = language or "english"
+            # Chat sessions are folder-less and default to English; project and
+            # coder sessions still require a real path + language.
             if mode == "chat":
                 path = ""
                 language = language or "english"
@@ -750,7 +816,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(
                     {"error": f"role '{role}' is not available in {mode} mode"}, 400)
                 return
-            session = _new_session(path, language, model, role, mode)
+            # The spec only feeds the coder graph; ignore it for other modes.
+            session = _new_session(path, language, model, role, mode,
+                                   spec_content=spec if mode == "coder" else "")
             self._send_json({"session": session})
         elif route == "/api/session/model":
             data = self._read_body()

@@ -83,3 +83,20 @@ class AgentTurnSchema(BaseModel):
             except (ValueError, TypeError):
                 return {}
         return v
+
+class ErrorOutput(BaseModel):
+    """The output of the error tool."""
+    file: str
+    line: int
+    column: int
+    message: str
+
+class CompileOutput(BaseModel):
+    """The output of the compile tool."""
+    status: str
+    language: str
+    compiler: str
+    exit_code: int
+    errors: list[ErrorOutput]
+    warnings: list[str]
+    duration_ms: int

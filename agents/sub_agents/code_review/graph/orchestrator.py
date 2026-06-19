@@ -31,6 +31,7 @@ Two surfaces live in this module:
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 from string import Template
 from typing import Any
@@ -38,19 +39,20 @@ from typing import Any
 import yaml
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.config import get_stream_writer
 
 from agents.llm_factory import make_llm
 
-from .structured_output import (
+from agents.sub_agents.code_review.graph.utils.structured_output import (
     AgentState,
     TaskPlan,
     PlannerOutput,
     SubTask,
     REVIEW_TASK_MARKER,
 )
-from .workspace import restore_snapshot, list_workspace_files
-from .validation import extract_paths, on_tree
-from .stats import stats
+from agents.sub_agents.code_review.graph.utils.workspace import restore_snapshot, list_workspace_files
+from agents.sub_agents.code_review.graph.utils.validation import extract_paths, on_tree
+from agents.sub_agents.code_review.graph.utils.stats import stats
 
 # Token-limit recovery is keyed on openai's LengthFinishReasonError. The graph
 # talks to Ollama, so openai may not be installed; degrade gracefully to an empty
@@ -67,7 +69,7 @@ _CFG_PATH = Path(__file__).resolve().parent / "graph_config.yaml"
 with open(_CFG_PATH, "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 
-MAX_ITERATIONS = _cfg.get("max_iterations", 20)
+MAX_ITERATIONS = _cfg.get("max_iterations", 100)
 MAX_RAW_CHARS = _cfg.get("max_raw_chars", 2000)
 MAX_WORKSPACE_FILES = _cfg.get("max_workspace_files", 120)
 MAX_TASK_ATTEMPTS = _cfg.get("max_task_attempts", 3)
@@ -184,11 +186,26 @@ def _run_reconsideration(
 
 
 def orchestrator_node(state: AgentState, config: RunnableConfig):
+    writer = get_stream_writer() # frontend-provided stream writer
+    # helper function to write text on stream for frontend (in Markdown)
+    def _w(text: str) -> None:
+        writer({"kind": "text", "text": text + "\n\n"})
+    def _w_scrollable(text: str) -> None:
+        html = (
+            f"<div style='max-height:150px;overflow-y:auto;padding:8px;"
+            f"border:1px solid #ccc;border-radius:6px;font-size:0.9em;"
+            f"white-space:pre-wrap;'>{text}</div>"
+        )
+        writer({"kind": "text", "text": html + "\n\n"})
+
+    writer({"kind": "stage", "stage": "orchestrator",
+            "label": "🧭 Orchestrator — planning next step"})
+
     iteration = state.get("iteration_count", 0)
 
     # ── Safety: iteration cap ────────────────────────────────────────────
     if iteration >= MAX_ITERATIONS:
-        print(f"\n[Orchestrator] Iteration limit ({MAX_ITERATIONS}) reached.")
+        _w(f"⛔ Iteration limit ({MAX_ITERATIONS}) reached — forcing completion.")
         completed = state["plan"].completed_tasks if state.get("plan") else []
         return {
             "plan": TaskPlan(
@@ -200,6 +217,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
             "context_store": {"skip_verification": True},
             "iteration_count": 1,
             "coder_retries": 0,
+            "architect_replans": 0,
         }
 
     current_plan = state.get("plan")
@@ -222,12 +240,12 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         stable_key = active_original or current_plan.instruction_for_agent
         failure_counts[stable_key] = failure_counts.get(stable_key, 0) + 1
         attempts = failure_counts[stable_key]
-        print(f"[Orchestrator] Task failure {attempts}/{MAX_TASK_ATTEMPTS}: {stable_key[:100]}")
+        _w(f"⚠️ Task failure **{attempts}/{MAX_TASK_ATTEMPTS}:** `{stable_key[:]}`")
         if attempts >= MAX_TASK_ATTEMPTS and stable_key not in abandoned_tasks:
             abandoned_tasks.append(stable_key)
             failure_counts.pop(stable_key, None)
             just_abandoned = stable_key
-            print(f"[Orchestrator] Abandoning task after {attempts} failed attempts: {stable_key[:100]}")
+            _w(f"🚫 Abandoning task after **{attempts}** failed attempts: `{stable_key[:]}`")
 
     # ── Silent full-task restore on failure ──────────────────────────────
     # Restore only when task_snapshot is non-empty, meaning the coder actually
@@ -240,17 +258,11 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         store = state.get("context_store", {})
         task_snap = store.get("task_snapshot", {})
         if task_snap:
-            configurable = config.get("configurable", {})
-            sandbox_dir = configurable.get(
-                "sandbox_dir",
-                _cfg.get("workspace", {}).get("default_sandbox_dir", "."),
-            )
+            sandbox_dir = state.get("project_path", ".")
             r, d = restore_snapshot(sandbox_dir, task_snap)
             if r or d:
-                print(f"[Orchestrator] Full task snapshot restored: {r} file(s) reverted, {d} removed.")
+                _w(f"♻️ Snapshot restored: **{r}** file(s) reverted, **{d}** removed.")
                 # Steps that passed before the failure had the validator refresh
-                # [workspace_files] to include files that were just reverted. Re-scan
-                # disk so planning below (rule 0) doesn't assume reverted files exist.
                 restored_ws = list_workspace_files(sandbox_dir)
                 # Those passed steps also committed confirmed exports for files now
                 # reverted. Prune every path the task touched from the registry so a
@@ -270,7 +282,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     # ── Step 1: Record outcome of the previous task ──────────────────────
     if current_plan and current_plan.instruction_for_agent:
         if has_failed:
-            print(f"[Orchestrator] Task failed, surfacing to LLM: {latest_report[:120]}")
+            _w(f"❌ Task failed — surfacing to LLM:\n\n> {latest_report[:]}")
             if just_abandoned:
                 current_plan.completed_tasks = list(current_plan.completed_tasks) + [
                     f"[ABANDONED after {MAX_TASK_ATTEMPTS} attempts] "
@@ -288,7 +300,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     if current_plan and current_plan.todo_list and not has_failed:
         todo = list(current_plan.todo_list)
         next_task = todo.pop(0)
-        print(f"[Orchestrator] Queue -> {next_task.agent}: {next_task.instruction}")
+        _w(f"▶️ Queue → **{next_task.agent}:** {next_task.instruction}")
         return {
             "plan": TaskPlan(
                 thinking_process="Dispatching next queued task.",
@@ -310,6 +322,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
             },
             "iteration_count": 1,
             "coder_retries": 0,
+            "architect_replans": 0,
         }
 
     # ── Step 2b: Reconsider or mechanically retry a failed task ─────────
@@ -332,9 +345,9 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         attempt = failure_counts.get(stable_key, 0)
 
         if reconsideration_count < TASK_RECONSIDERATION_BUDGET:
-            print(
-                f"[Orchestrator] Reconsideration {reconsideration_count + 1}/{TASK_RECONSIDERATION_BUDGET} "
-                f"for task (attempt {attempt}/{MAX_TASK_ATTEMPTS}), "
+            _w(
+                f"🔄 Reconsideration **{reconsideration_count + 1}/{TASK_RECONSIDERATION_BUDGET}** "
+                f"for task (attempt **{attempt}/{MAX_TASK_ATTEMPTS}**), "
                 f"queue preserved ({len(current_plan.todo_list)} task(s))."
             )
             recon_out = _run_reconsideration(state, current_plan, latest_report, attempt)
@@ -368,12 +381,13 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
                     "context_store": recon_ctx,
                     "iteration_count": 1,
                     "coder_retries": 0,
+                    "architect_replans": 0,
                 }
             # Reconsideration LLM failed — fall through to mechanical retry below.
 
         # Budget exhausted or reconsideration LLM unavailable: mechanical re-dispatch.
-        print(
-            f"[Orchestrator] Mechanical retry (attempt {attempt + 1}/{MAX_TASK_ATTEMPTS}), "
+        _w(
+            f"🔁 Mechanical retry (attempt **{attempt + 1}/{MAX_TASK_ATTEMPTS}**), "
             f"queue preserved ({len(current_plan.todo_list)} task(s) still queued)."
         )
         retry_ctx = {
@@ -403,6 +417,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
             "context_store": retry_ctx,
             "iteration_count": 1,
             "coder_retries": 0,
+            "architect_replans": 0,
         }
 
     # ── Review-first: evidence-based first plan on a resumed/existing project ──
@@ -419,7 +434,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         and _rf_store.get("workspace_files")
         and not _rf_store.get("reviewed_at_start", False)
     ):
-        print("[Orchestrator] Review-first: existing workspace detected — reviewing before planning.")
+        _w("🔍 Review-first: existing workspace detected — reviewing before planning.")
         review_instruction = (
             f"{REVIEW_TASK_MARKER} <goal>Evaluate project completeness: compare actual workspace "
             "against canonical file tree, check all file contents and imports against the "
@@ -436,17 +451,18 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
             "context_store": {"reviewed_at_start": True},
             "iteration_count": 1,
             "coder_retries": 0,
+            "architect_replans": 0,
         }
 
     # ── Step 3: LLM planning (queue empty, first run, or abandonment) ────
-    print("[Orchestrator] Running LLM planner...")
+    _w("🧠 Running LLM planner...")
 
     # Get config for Orchestrator
     orch = _cfg["agents"]["orchestrator"]
 
     # If has_failed = true, inject the recovery prompt instead of the default one
     if has_failed:
-        print("[Orchestrator] Task failed, injecting recovery prompt...")
+        _w("💉 Task failed — injecting recovery prompt.")
         prompt = _cfg["prompts"]["orchestrator_recovery"]
     else:
         prompt = _cfg["prompts"]["orchestrator"]
@@ -462,6 +478,8 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     context_vars = {
         "spec_content": store.get("spec_content", ""),
         "inspector_raw": store.get("inspector_raw", ""),
+        "inspector_files": "\n".join(f"  {f}" for f in (store.get("inspector_files", []) or [])),
+        "inspector_issues": "\n".join(f"  - {i}" for i in (store.get("inspector_issues", []) or [])),
         "verification_gaps": store.get("verification_gaps", ""),
         "validation_issues": store.get("validation_issues", ""),
         "workspace_files": "\n".join(store.get("workspace_files", []) or []),
@@ -520,7 +538,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     except Exception as e:
         # Try one more time with stripped-down prompt
         if isinstance(e, LengthFinishReasonError):
-            print("[Orchestrator] Token limit hit, retrying with minimal context...")
+            _w("⚠️ Token limit hit — retrying with minimal context...")
             minimal_prompt = Template(prompt).safe_substitute(
                 objective=state["objective"],
                 completed_tasks=f"{len(existing_completed)} tasks done. Last 3: {existing_completed[-3:]}",
@@ -531,21 +549,26 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
             minimal_messages = [HumanMessage(content=minimal_prompt)]
             result = structured_llm.invoke(minimal_messages)  # still raises if this fails too
         else:
-            print(f"[Orchestrator] LLM call failed: {e}")
+            _w(f"❌ LLM call failed: `{e}`")
             raise
 
     if result.get("raw"):
         stats.record_tokens(result["raw"])
+        # Surface this call's token usage on the custom channel. The server can't
+        # see the graph's internal model calls
+        usage = getattr(result["raw"], "usage_metadata", None) or {}
+        if usage.get("output_tokens") or usage.get("input_tokens"):
+            writer({"kind": "usage", "usage": usage})
 
     planner_out = result["parsed"]
 
     if planner_out is None and result["raw"]:
         raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
-        print("[Orchestrator] Schema parse failed, trying fallback parser...")
+        _w("⚠️ Schema parse failed — trying fallback parser...")
         planner_out = _parse_plan_fallback(raw_text)
 
     if planner_out is None:
-        print("[Orchestrator] LLM returned empty response, forcing completion.")
+        _w("⚠️ LLM returned empty response — forcing completion.")
         return {
             "plan": TaskPlan(
                 thinking_process="LLM returned no plan.",
@@ -561,6 +584,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
             },
             "iteration_count": 1,
             "coder_retries": 0,
+            "architect_replans": 0,
         }
 
     # ── Ground the plan in the canonical tree ────────────────────────────
@@ -571,9 +595,9 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     if file_tree:
         kept, dropped = _sanitize_todo(planner_out.todo_list, file_tree)
         for t, off in dropped:
-            print(f"[Orchestrator] Dropped off-tree task ({off}): {t.instruction[:100]}")
+            _w(f"🌲 Dropped off-tree task (`{off}`): {t.instruction[:]}")
         if dropped and not kept:
-            print("[Orchestrator] All tasks were off-tree — requesting one grounded re-plan...")
+            _w("🌲 All tasks were off-tree — requesting one grounded re-plan...")
             tree_text = "\n".join(f"  {p}" for p in file_tree)
             off_all = sorted({f for _, off in dropped for f in off})
             correction_prompt = Template(prompt).safe_substitute(
@@ -607,7 +631,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
                     kept, _ = _sanitize_todo(fixed_out.todo_list, file_tree)
                     planner_out = fixed_out
             except Exception as e:
-                print(f"[Orchestrator] Grounded re-plan failed: {e}")
+                _w(f"❌ Grounded re-plan failed: `{e}`")
         planner_out = PlannerOutput(thinking_process=planner_out.thinking_process, todo_list=kept)
 
     # Drop any (re)planned task whose instruction exactly matches one we already
@@ -616,7 +640,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         before = len(planner_out.todo_list)
         kept_tasks = [t for t in planner_out.todo_list if t.instruction not in abandoned_tasks]
         if len(kept_tasks) != before:
-            print(f"[Orchestrator] Dropped {before - len(kept_tasks)} re-planned task(s) matching abandoned instructions.")
+            _w(f"🚫 Dropped **{before - len(kept_tasks)}** re-planned task(s) matching abandoned instructions.")
         planner_out = PlannerOutput(thinking_process=planner_out.thinking_process, todo_list=kept_tasks)
 
     # ── Force-append a review inspector task at the end of every non-empty plan ─
@@ -659,10 +683,17 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         instruction_for_agent=instruction_for_agent,
     )
 
-    print(f"[Orchestrator] Plan: {new_plan.next_agent} -> {new_plan.instruction_for_agent}")
-    print("Remaining Tasks:")
-    for i, task in enumerate(new_plan.todo_list):
-        print(f"  {i+1}. {task.agent} -> {task.instruction[:100]}")
+    # print a final plan summary (next plan + queue)
+    remaining_md = "\n".join(
+        f"  {i + 1}. `{task.agent}` — {task.instruction[:100]}"
+        for i, task in enumerate(new_plan.todo_list)
+    )
+    _w(f"### 📋 Plan\n\n**Next:** `{new_plan.next_agent}` —")
+    _w_scrollable(new_plan.instruction_for_agent)
+    _w(
+        (f"**Queue:**\n{remaining_md}" if remaining_md else "_No remaining tasks._")
+    )
+
     return_context = {
         "task_snapshot": {},
         "task_failure_counts": failure_counts,
@@ -680,6 +711,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         "iteration_count": 1,
         "coder_retries": 0,
         "context_store": return_context,
+        "architect_replans": 0,
     }
 
 
@@ -723,10 +755,7 @@ class Orchestrator:
         self._model_configs = model_configs
         self._recursion_limit = recursion_limit
 
-        # The graph's per-node LLMs come from graph_config.yaml, not from the model
-        # the UI selects, so model routing is not parameterised yet — every pool
-        # entry shares one compiled graph. (TODO: thread the selected model into the
-        # nodes when this replaces CodeReviewOrchestrator.)
+        # The graph's per-node LLMs come from graph_config.yaml
         app = get_app(checkpointer=checkpointer)
         self._pool: dict[str, Any] = {name: app for name in model_configs}
         self._default_name = default_model or next(iter(self._pool))
@@ -754,9 +783,15 @@ class Orchestrator:
             return self.default
         return self._pool.get(model_name, default if default is not None else self.default)
 
+    def _ensure_config(self, config: dict | None) -> dict:
+        cfg = dict(config or {})
+        cfg.setdefault("configurable",{})
+        cfg["configurable"].setdefault("thread_id", str(uuid.uuid4()))
+        return cfg
+
     def stream(self, payload: dict, *, model: str | None = None,
                config: dict | None = None, stream_mode: Any = "messages"):
-        yield from self.get(model).stream(payload, config=config, stream_mode=stream_mode)
+        yield from self.get(model).stream(payload, config=self._ensure_config(config), stream_mode=stream_mode)
 
-    def invoke(self, payload: dict, *, model: str | None = None, config: dict | None = None):
-        return self.get(model).invoke(payload, config=config)
+    def invoke(self, payload, *, model=None, config=None):
+        return self.get(model).invoke(payload, config=self._ensure_config(config))

@@ -8,12 +8,14 @@ const state = {
   models: [],
   roles: [],
   toolsByRole: {},
-  roleModes: {},         // role -> "chat" | "project"
+  roleModes: {},         // role -> "chat" | "project" | "coder"
   createMode: "project", // which type the new-session form is building
   streaming: false,      // is an agent turn currently running?
   streamingId: null,     // tracks which session is streaming
   queue: [],             // follow-up messages waiting to be sent: {text, attachments}
   attachments: [],       // pending files for the next message: {name,type,size,data}
+  specContent: "",       // optional spec/context file text for a new coder session
+  specName: "",          // its filename (shown in the drop zone)
   timer: null,           // live response-time interval handle
   turnStart: 0,
 };
@@ -131,16 +133,23 @@ function populateRoles() {
   }
 }
 
-// Switch the new-session form between "project" and "chat": highlight the chosen
-// button, show/hide the folder + language fields, refilter roles, relabel Start.
+// Switch the new-session form between "project", "chat" and "coder": highlight the
+// chosen button, show/hide the folder + language fields, the role/model pickers and
+// the coder spec drop zone, refilter roles, relabel Start.
 function setCreateMode(mode) {
   state.createMode = mode;
   for (const btn of document.querySelectorAll("#mode-toggle .mode-btn")) {
     btn.classList.toggle("active", btn.dataset.mode === mode);
   }
+  // Chat needs no folder; coder needs one. Both project + coder show the folder.
   $("project-fields").classList.toggle("hidden", mode === "chat");
+  // Coder is driven entirely by graph_config.yaml — no role/model choice. It gets
+  // an optional spec file instead.
+  $("role-model-fields").classList.toggle("hidden", mode === "coder");
+  $("spec-fields").classList.toggle("hidden", mode !== "coder");
   populateRoles();
-  $("start-btn").textContent = mode === "chat" ? "Start chat" : "Start review";
+  $("start-btn").textContent =
+    mode === "chat" ? "Start chat" : mode === "coder" ? "Start coder" : "Start review";
 }
 
 // ── UI bindings ────────────────────────────────────────────────────────
@@ -185,6 +194,58 @@ function bindUI() {
   });
 
   bindDragAndDrop();
+  bindSpecDrop();
+}
+
+// ── Coder spec file (optional context loaded into context_store.spec_content) ──
+function bindSpecDrop() {
+  const drop = $("spec-drop");
+  const input = $("spec-input");
+  if (!drop || !input) return;
+
+  drop.addEventListener("click", () => input.click());
+  input.addEventListener("change", (e) => {
+    if (e.target.files && e.target.files[0]) loadSpecFile(e.target.files[0]);
+    e.target.value = "";  // allow re-selecting the same file
+  });
+
+  drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("dragover"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("dragover"));
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault();
+    drop.classList.remove("dragover");
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) loadSpecFile(e.dataTransfer.files[0]);
+  });
+}
+
+function loadSpecFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    state.specContent = String(reader.result || "");
+    state.specName = file.name;
+    renderSpecName();
+  };
+  reader.onerror = () => alert(`Could not read "${file.name}".`);
+  reader.readAsText(file);  // markdown / text / yaml -> plain text
+}
+
+function clearSpec() {
+  state.specContent = "";
+  state.specName = "";
+  renderSpecName();
+}
+
+function renderSpecName() {
+  const drop = $("spec-drop");
+  const label = $("spec-name");
+  if (!drop || !label) return;
+  if (state.specName) {
+    label.textContent = `📄 ${state.specName} — click to replace`;
+    drop.classList.add("loaded");
+  } else {
+    label.textContent = "Drop a .md / .txt / .yaml file, or click to choose";
+    drop.classList.remove("loaded");
+  }
 }
 
 // ── Drag & drop files onto the chat pane ───────────────────────────────
@@ -300,6 +361,7 @@ async function browseFolder() {
 async function startSession() {
   const mode = state.createMode;
   const isChat = mode === "chat";
+  const isCoder = mode === "coder";
   const path = $("path-input").value.trim();
   const language = $("language-select").value;
   const errBox = $("new-session-error");
@@ -317,8 +379,12 @@ async function startSession() {
         mode,
         path: isChat ? "" : path,
         language,
+        // Coder mode ignores these server-side (role + model come from
+        // graph_config.yaml); send them anyway for the other modes.
         model: $("model-select").value,
         role: $("role-select").value,
+        // Optional spec/context file text, only meaningful for coder mode.
+        spec: isCoder ? state.specContent : "",
       }),
     });
     const data = await res.json();
@@ -327,6 +393,7 @@ async function startSession() {
     renderSessionList();
     selectSession(data.session.id);
     $("path-input").value = "";
+    if (isCoder) clearSpec();  // hand the spec off to this session; reset the form
     // Project sessions auto-kick off a review; chat sessions wait for the user.
     // if (!isChat) sendMessage("Review this project.");
   } catch (e) {
@@ -334,7 +401,7 @@ async function startSession() {
     console.error(e);
   } finally {
     btn.disabled = false;
-    btn.textContent = isChat ? "Start chat" : "Start review";
+    btn.textContent = isChat ? "Start chat" : isCoder ? "Start coder" : "Start review";
   }
 }
 
@@ -348,7 +415,8 @@ function renderSessionList() {
 
     const info = el("div", "flex-1 min-w-0");
     info.appendChild(el("div", "session-title truncate", s.title));
-    const label = (s.mode || "project") === "chat" ? "chat" : s.language;
+    const sMode = s.mode || "project";
+    const label = sMode === "chat" ? "chat" : sMode === "coder" ? "coder" : s.language;
     const meta = `${label} · ${fmtTime(s.created)}`;
     info.appendChild(el("div", "session-meta truncate",
       meta + (s.restored ? " · restored" : "")));
@@ -466,8 +534,10 @@ async function switchRole(newRole) {
 // One source of truth for the header subtitle. Chat sessions have no folder, so
 // they lead with "Chat" instead of a path/language.
 function subtitleFor(s) {
-  const isChat = (s.mode || "project") === "chat";
-  const lead = isChat ? "Chat" : `${s.path}  ·  ${s.language}`;
+  const mode = s.mode || "project";
+  // Coder is config-driven (no user-chosen role/model): lead with the folder only.
+  if (mode === "coder") return `Coder  ·  ${s.path}`;
+  const lead = mode === "chat" ? "Chat" : `${s.path}  ·  ${s.language}`;
   return `${lead}  ·  ${s.model}` + (s.role ? `  ·  ${s.role}` : "");
 }
 
@@ -571,11 +641,12 @@ function renderActive() {
     lsw.appendChild(o);
   }
 
-  // Hide all switchers while streaming, show them once idle.
+  // Hide all switchers while streaming, show them once idle. Coder sessions are
+  // fully config-driven (graph_config.yaml), so they never expose the switchers.
   sw.classList.add("hidden");
   rsw.classList.add("hidden");
   lsw.classList.add("hidden");
-  if (!state.streaming) {
+  if (!state.streaming && sessionMode !== "coder") {
     sw.classList.remove("hidden");
     rsw.classList.remove("hidden");
     lsw.classList.remove("hidden");
@@ -730,18 +801,25 @@ function addMessageBubble(role, content, ts, meta) {
 // hangs under the last text bubble (or stands alone if the turn ended on a tool).
 function renderAssistantTurn(m) {
   let lastWrap = null;
+  let toolRow = null;
   for (const part of m.parts) {
     if (part.type === "text") {
       if (!part.content) continue;
       const { wrap, bubble } = makeAssistantBubble();
       bubble.innerHTML = marked.parse(part.content);
       lastWrap = wrap;
+      toolRow = null;
     } else if (part.type === "tool") {
-      $("messages").appendChild(buildToolBubble(part.name, part.target, true));
-      lastWrap = null;  // a footer should never hang off a tool pill
+      if (!toolRow) {
+        toolRow = el("div", "self-start flex flex-row flex-wrap gap-2");
+        $("messages").appendChild(toolRow);
+      }
+      toolRow.appendChild(buildToolBubble(part.name, part.target, true));
+      lastWrap = null;
     } else if (part.type === "stage") {
       addStageBanner(part.label);
-      lastWrap = null;  // a footer should never hang off a stage banner
+      lastWrap = null;
+      toolRow = null;
     }
   }
   const footer = el("div", "bubble-meta", bubbleMetaText("assistant", m.ts, m));
@@ -875,6 +953,7 @@ async function sendMessage(text, attachments = []) {
   setStatus("working", "Working…");
   clearTools();
   state.openToolBubbles = {};
+  state.openToolRow = null;
   showTyping();  // blinking dots until the first token / through tool calls
 
   const ctx = { bubble: null, answer: "", full: "" };
@@ -973,6 +1052,7 @@ function closeStreamBubble(ctx) {
   if (ctx.bubble) {
     ctx.bubble.classList.remove("streaming");
     ctx.bubble = null;
+    state.openToolRow = null;  // text ended; next tools start a fresh row below it
   }
 }
 
@@ -1002,6 +1082,7 @@ function handleEvent(evt, ctx) {
       // text segment, drop a dedicated stage bubble, and keep the loader pinned.
       closeStreamBubble(ctx);
       addStageBanner(evt.label);
+      state.openToolRow = null;
       setStatus("working", `${evt.label}…`);
       showTyping();
       break;
@@ -1024,6 +1105,7 @@ function handleEvent(evt, ctx) {
         addStageDivider(evt.next_mode);
         ctx.full = "";
         ctx.answer = "";
+        state.openToolRow = null;
         setStatus("working", `Switched to ${evt.next_mode}…`);
         showTyping();
       } else {
@@ -1196,27 +1278,36 @@ function updateTool(name, phase) {
 // ── In-chat tool bubbles (persistent, distinct colour) ─────────────────
 // A small violet pill inserted above the streaming answer for each tool the
 // agent runs, showing the affected file + directory once the call completes.
+function ensureToolRow() {
+  // Recreate if missing, or if a mid-stream re-render (renderActive clears
+  // #messages) left our cached row detached — appending into a detached row
+  // would make new tool pills silently vanish.
+  if (!state.openToolRow || !state.openToolRow.isConnected) {
+    state.openToolRow = el("div", "self-start flex flex-row flex-wrap gap-2");
+    $("messages").appendChild(state.openToolRow);
+  }
+  return state.openToolRow;
+}
+
 function renderToolBubble(evt) {
   state.openToolBubbles = state.openToolBubbles || {};
 
   if (evt.phase === "start") {
-    // Append at the bottom: the current text segment was just closed, so the
-    // pill reads right after the text it follows (and before any follow-up).
     const wrap = buildToolBubble(evt.name, null, false);
-    $("messages").appendChild(wrap);
+    ensureToolRow().appendChild(wrap);
     state.openToolBubbles[evt.name] = wrap;
     scrollMessages();
     return;
   }
 
-  // phase === "end": finalise the open bubble for this tool, or create a
+  // phase === "end": finalise the open bubble for this tool, or create an
   // already-completed one if the start was de-duplicated server-side.
   const open = state.openToolBubbles[evt.name];
   if (open) {
     open.replaceWith(buildToolBubble(evt.name, evt.target, true));
     delete state.openToolBubbles[evt.name];
   } else {
-    $("messages").appendChild(buildToolBubble(evt.name, evt.target, true));
+    ensureToolRow().appendChild(buildToolBubble(evt.name, evt.target, true));
   }
   scrollMessages();
 }

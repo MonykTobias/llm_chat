@@ -28,11 +28,15 @@ _REPLACE_KEYS = {
     "task_reconsideration_count", # how many reconsiderations have fired for the current task
     "review_report",              # JSON ReviewOutput written by the review inspector
     "reviewed_at_start",          # True once the first-round review-first pass has fired
-    # Module-interface registry (path -> public symbol names). All three are
-    # full-replacement: each writer recomputes the whole dict it owns.
     "module_exports",          # confirmed exports, committed only on validator PASS
     "module_exports_planned",  # scaffold's provisional interface map (forward refs)
     "module_exports_pending",  # coder self-report for current step, awaiting commit
+    "inspector_raw",  # full findings text from explore mode
+    "inspector_files",  # files of interest from ExploreOutput
+    "inspector_issues",  # issues found from ExploreOutput
+    "explore_summary",
+    "explore_files",
+    "explore_issues"
 }
 
 
@@ -160,6 +164,20 @@ class CoderOutput(BaseModel):
         description="All file changes to apply."
     )
 
+# ── Explorer Models ──────────────────────────────────────────────────────────
+
+class ExplorerOutput(BaseModel):
+    summary: str = Field(
+        description="2-3 sentence overview of what was found."
+    )
+    files_of_interest: list[str] = Field(
+        default=[],
+        description="Relative file paths worth the architect's attention."
+    )
+    issues: list[str] = Field(
+        default=[],
+        description="Anything broken, missing, or suspicious found during investigation."
+    )
 
 # ── Validator Models ─────────────────────────────────────────────────────────
 
@@ -191,43 +209,6 @@ class ReviewOutput(BaseModel):
     missing_files: list[str] = Field(default=[])
     new_files: list[str] = Field(default=[])
 
-
-# ── Compiler Models ─────────────────────────────────────────────────────────────
-
-class CompilerIssue(BaseModel):
-    file_path: str = Field(default="")
-    line_number: int | None = Field(default=None)
-    column_number: int | None = Field(default=None)
-    severity: Literal["error", "warning", "pass"] = Field(default="error")
-    code: str | None = Field(default=None)
-    description: str = Field(default="")
-
-class CompilerOutput(BaseModel):
-    location: Literal["frontend", "backend", "root"] = Field(default="root")
-    command: str = Field(default="")
-    exit_code: int = Field(default=0)
-    issues: list[CompilerIssue] = Field(default_factory=list)
-    raw_stdout: str = Field(default="")
-    raw_stderr: str = Field(default="")
-
-    @computed_field
-    def status(self) -> Literal["pass","warning","error"]:
-        """Derived from actual issues"""
-        severities = {i.severity for i in self.issues}
-        if "error" in severities:
-            return "error"
-        if "warning" in severities:
-            return "warning"
-        return "pass"
-
-    @computed_field
-    def error_count(self) -> int:
-        return sum(1 for i in self.issues if i.severity == "error")
-
-    @computed_field
-    def warning_count(self) -> int:
-        return sum(1 for i in self.issues if i.severity == "warning")
-
 # ── Graph State ──────────────────────────────────────────────────────────────
 # This is the shared state that flows between all agents in the LangGraph.
 #
@@ -249,3 +230,7 @@ class AgentState(TypedDict):
     coder_retries: int
     architect_replans: int      # how many times architect has re-planned the current step
     architect_step_queue: list  # remaining ArchitectStep dicts to dispatch
+    project_path: str
+    language: str
+    enabled_tools: list[str]
+    messages: list

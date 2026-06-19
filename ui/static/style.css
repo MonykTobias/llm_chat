@@ -176,6 +176,20 @@ select.field { cursor: pointer; appearance: none;
 .seg-btn:hover { color: var(--text); }
 .seg-btn.active { background: var(--surface); color: var(--accent); box-shadow: var(--shadow-card); }
 
+/* ── Spec drop zone (coder mode, optional context file) ─────────────────── */
+.spec-drop {
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  min-height: 64px; padding: 12px; cursor: pointer;
+  border: 1.5px dashed var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  transition: border-color .15s ease, background-color .15s ease, color .15s ease;
+}
+.spec-drop:hover { border-color: var(--accent); background: var(--accent-soft); }
+.spec-drop.dragover { border-color: var(--accent); background: var(--accent-soft); }
+.spec-drop.loaded { border-style: solid; border-color: var(--accent); color: var(--accent); }
+.spec-drop-text { font-size: 12px; color: var(--text-muted); word-break: break-all; }
+.spec-drop.loaded .spec-drop-text { color: var(--accent); font-weight: 600; }
+
 /* ── Header pill-selects (role / model / language switchers) ────────────── */
 .pill-select {
   font-size: 12px; color: var(--text); cursor: pointer;

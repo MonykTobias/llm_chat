@@ -46,7 +46,6 @@ __all__ = [
     "graph_for",
     "review_agent",
     "review_session",
-    "STAGE_NODE_NAMES",
 ]
 
 # ── config ──────────────────────────────────────────────────────────────────
@@ -83,6 +82,7 @@ AGENT_CLASSES: dict[str, type[BaseAgent]] = {
     "cr_plan": CodeReviewPlan,
     "cr_act" : CodeReviewAct,
     "cr_verify" : CodeReviewVerify,
+
     # "code-review": CodeReviewAgent,   # default, no entry needed
     # "explore":     CodeReviewAgent,   # default, no entry needed
 }
@@ -103,15 +103,10 @@ AGENTS: dict[str, BaseAgent] = {
 # drives the four stage agents. It needs them already built, so it is wired AFTER
 # the comprehension with direct references (no lazy lookup, no import cycle). Its
 # config.yaml `prompt:` entry exists only so the UI lists the role.
-from agents.sub_agents.code_review.orchestrator import (  # noqa: E402
-    CodeReviewOrchestrator,
-    STAGE_NODE_NAMES,
-    STAGE_ROLES,
-)
+from agents.sub_agents.code_review.graph import Orchestrator as CodeReviewGraph
 
-AGENTS["code-assistant"] = CodeReviewOrchestrator(
+AGENTS["code-assistant"] = CodeReviewGraph(
     _cfg["agents"],
-    stage_agents={stage: AGENTS[role] for stage, role in STAGE_ROLES.items()},
     checkpointer=_checkpointer,
     recursion_limit=_cfg.get("recursion_limit", 1000),
     default_model="main_agent",

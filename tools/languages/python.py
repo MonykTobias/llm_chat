@@ -1,478 +1,198 @@
-"""Python language tools: pylint, pytest, mypy, and a static import check.
+"""Python language tools: pylint, pytest, mypy, and a static import check — all
+run inside the `crav-python` container so the host needs no Python toolchain.
 
-Required for full results (installed in the reviewed project's venv, or in
-code_review_agent's own .venv as a fallback):
-    * pylint   — linter            (run_linter)
-    * pytest   — test runner       (run_tests);  pytest-cov for --cov coverage
-    * mypy     — static type check (run_type_check)
-The import check (check_imports) is pure standard library (ast) — it needs
-nothing installed and never executes the project's code.
+The image (see ``docker/crav-python.Dockerfile``) bakes in pylint, mypy, pytest
+and pytest-cov. Project deps are pre-installed into a per-project derived image
+by `_ensure_project_image` (in base.py): the first review of a project pays the
+`pip install` cost once; every subsequent review reuses the cached Docker layer
+and pays nothing. The derived image tag is keyed on the manifest *content*, so
+it auto-invalidates when requirements.txt (or pyproject.toml) changes.
 
-Dependency auto-provisioning: before linting/testing/type-checking we `pip
-install` the project's manifest (requirements.txt / pyproject.toml / setup.py)
-into its venv — or into a managed venv we create under code_review_agent/.toolenvs
-when the project has none — so mypy/pytest can resolve the project's third-party
-imports. This runs at most once per project per server run.
+The import check is our own stdlib AST analyzer shipped as
+``docker/import_check.py``; running it inside the dep-installed container is what
+lets ``find_spec`` resolve third-party packages (it never executes project code).
 """
 from __future__ import annotations
 
-import ast
-import importlib.util
-import sys
+import re
 from pathlib import Path
 
-from tools._common import _IGNORE, _rel, _truncate, _vendor_ignore_regex
+from structured_output import CompileOutput, ErrorOutput
+from tools._common import _IGNORE, _vendor_ignore_regex
 
 from .base import (
-    _create_managed_venv,
-    _find_project_venv,
-    _module_importable,
-    _provision_once,
-    _run,
-    _run_python_tool,
-    _venv_python,
+    _compile_path,
+    _compile_result,
+    _ensure_project_image,
+    _run_docker,
+    _run_docker_text,
 )
 
-# Names that resolve without an installed third-party package: the stdlib plus
-# the built-ins. `stdlib_module_names` exists on 3.10+; fall back gracefully.
-_STDLIB = frozenset(getattr(sys, "stdlib_module_names", frozenset())) | \
-          frozenset(sys.builtin_module_names)
+_IMAGE = "crav-python"
+# The directory holding import_check.py; mounted read-only at /checker.
+_SCRIPT_DIR = Path(__file__).parent / "docker"
 
-_MANIFESTS = ("requirements.txt", "pyproject.toml", "setup.py", "setup.cfg")
+# Docker image used to byte-compile the project (syntax check, no execution).
+_COMPILE_IMAGE = _IMAGE
+
+# Select files to compile with `find ... -prune` so vendored dirs (.venv,
+# node_modules, …) are never *descended into* — `compileall -x` only skips
+# compiling matched files, it still os.walks every dir, which stat-walks the
+# whole .venv over the slow bind mount and times out. We feed the pruned file
+# list to `compileall -i` and run against the read-only /src directly (no copy),
+# with PYTHONPYCACHEPREFIX redirecting bytecode to /tmp (set in compile_code).
+_COMPILE_PRUNE = " -o ".join(f"-name {name}" for name in sorted(_IGNORE))
+_COMPILE_CMD = (
+    r"find /src -type d \( " + _COMPILE_PRUNE + r" \) -prune "
+    r"-o -type f -name '*.py' -print > /tmp/flist && "
+    r"python -m compileall -q -i /tmp/flist"
+)
+
+# compileall reports a failing file as a block: a `File "...", line N` header,
+# the offending source line, a caret pointing at the column, then `XxxError: msg`.
+_PY_FILE_RE = re.compile(r'File "([^"]+)", line (\d+)')
+_PY_MSG_RE = re.compile(r"^\s*\w*(?:Error|Warning):")
+
+# Manifests we look for, in priority order.  The first one found in the project
+# root is used to build the derived image.
+_MANIFESTS = ["requirements.txt", "pyproject.toml", "setup.py", "setup.cfg"]
 
 
-# ── dependency provisioning ──────────────────────────────────────────────
+# ── per-project derived image ─────────────────────────────────────────────
 
-def _python_manifest(project: str) -> "Path | None":
-    root = Path(project)
-    for name in _MANIFESTS:
-        p = root / name
-        if p.is_file():
-            return p
-    return None
+def _pip_install_cmd(manifest_name: str) -> str:
+    """Return the pip install command to bake into the derived image's RUN layer.
+
+    For requirements.txt we install directly from the file copied into /tmp.
+    For pyproject / setup.* we install from the file path too — pip can resolve
+    a pyproject.toml's [project] dependencies from the file alone for the common
+    static case. If the project uses dynamic metadata that needs the full source
+    tree, the install will partially fail (pip falls back gracefully), but the
+    layer cache still works and the common case is fully covered.
+    """
+    if manifest_name == "requirements.txt":
+        return f"pip install --no-cache-dir -q -r /tmp/{manifest_name}"
+    # pyproject.toml / setup.py / setup.cfg: install as a project
+    return f"pip install --no-cache-dir -q /tmp/{manifest_name}"
 
 
-def _provision(project: str) -> None:
-    """pip-install the project's declared deps into a usable venv (best effort)."""
-    manifest = _python_manifest(project)
-    if manifest is None:
-        return
-    # Prefer the project's own venv; otherwise create a managed one so we don't
-    # pollute code_review_agent's interpreter with the reviewed project's deps.
-    py = _find_project_venv(project) or _create_managed_venv(project)
-    cmd = [py, "-m", "pip", "install", "-q"]
-    if manifest.name == "requirements.txt":
-        cmd += ["-r", str(manifest)]
-    else:  # pyproject.toml / setup.py / setup.cfg -> install the project itself
-        cmd += [str(project)]
-    _run(cmd, timeout=600)
+def _project_image(path: str) -> "tuple[str, str | None]":
+    """Return (image_tag, warning) for the project at `path`.
+
+    Delegates to `_ensure_project_image` with the Python-specific manifest list
+    and install command builder.  The returned image is either the pre-baked
+    derived image (deps already installed) or the plain _IMAGE base (if no
+    manifest was found or the build failed), in which case `warning` is set.
+    """
+    return _ensure_project_image(
+        base_image=_IMAGE,
+        project_path=path,
+        manifests=_MANIFESTS,
+        install_cmd_fn=_pip_install_cmd,
+    )
+
+
+def _prepend_warning(warning: "str | None", result: str) -> str:
+    """Prepend an environment warning to a tool result string, if present."""
+    return f"{warning}\n{result}" if warning else result
 
 
 # ── linter / tests / type check ──────────────────────────────────────────
 
 def run_linter(path: str, language: str) -> str:
     """pylint, scoped to skip vendored dirs and the slow duplicate-code checker."""
-    _provision_once(path, "python", _provision)
     # Recurse but skip vendored/ignored dirs (.venv etc.), use all cores, and drop
-    # duplicate-code — a bare `pylint <root>` otherwise lints thousands of .venv
-    # files and times out. Longer budget since real projects can still be large.
-    args = [
-        "--recursive=y",
-        f"--ignore-paths={_vendor_ignore_regex()}",
-        "--jobs=0",
-        "--disable=duplicate-code",
-        path,
-    ]
-    return _run_python_tool(_venv_python(path), "pylint", args, timeout=300)
+    # duplicate-code — a bare `pylint .` otherwise lints thousands of vendored
+    # files and times out. We prune by directory *basename* via --ignore (pylint
+    # matches it against the basename of each dir during its recursive os.walk);
+    # every _IGNORE entry is already a plain dir basename.
+    image, warn = _project_image(path)
+    cmd = (
+        f"pylint --recursive=y --ignore={','.join(sorted(_IGNORE))} "
+        "--jobs=0 --disable=duplicate-code ."
+    )
+    result = _run_docker_text(image, cmd, path, name="pylint", timeout=300)
+    return _prepend_warning(warn, result)
 
 
 def run_tests(path: str, language: str, include_coverage: bool = True) -> str:
     """pytest, scoped out of vendored dirs so it doesn't collect .venv's own tests."""
-    _provision_once(path, "python", _provision)
-    py = _venv_python(path)
     # -o norecursedirs overrides any project config so collection never descends
     # into .venv/node_modules/build; explicit --ignore for the ones at the root;
-    # -q / no cache to trim noise.
-    args = ["-q", "-p", "no:cacheprovider",
-            f"--override-ini=norecursedirs={' '.join(sorted(_IGNORE))}"]
+    # -q / no cache to trim noise. pytest-cov is baked into the image, so --cov is
+    # always available when coverage is requested.
+    image, warn = _project_image(path)
+    args = ["pytest", "-q", "-p", "no:cacheprovider",
+            f"--override-ini=norecursedirs='{' '.join(sorted(_IGNORE))}'"]
     root = Path(path)
     for name in sorted(_IGNORE):
         if (root / name).is_dir():
-            args.append(f"--ignore={root / name}")
-    args.append(path)
-    # --cov needs the pytest-cov plugin in `py`. If it's missing, pytest aborts the
-    # whole run with "unrecognized arguments: --cov" (the model misreads this as
-    # "tests can't run"), so only add it when the plugin is actually importable and
-    # otherwise note that coverage was skipped — the pass/fail result still lands.
-    cov = include_coverage and _has_pytest_cov(py)
-    if cov:
+            args.append(f"--ignore={name}")
+    if include_coverage:
         args.append("--cov")
-    out = _run_python_tool(py, "pytest", args)
-    if include_coverage and not cov:
-        out = ("[coverage skipped: pytest-cov is not installed in the test "
-               "interpreter, so pytest ran without --cov. This is an environment "
-               "limitation, not a test failure — judge the results below on their "
-               "own.]\n" + out)
-    return out
-
-
-# pytest-cov availability per interpreter — the probe spawns a process, so cache
-# it for the server's lifetime (same interpreter answers the same way every time).
-_PYTEST_COV: dict[str, bool] = {}
-
-
-def _has_pytest_cov(python_exe: str) -> bool:
-    """Whether the pytest-cov plugin is importable in `python_exe` (cached)."""
-    ok = _PYTEST_COV.get(python_exe)
-    if ok is None:
-        ok = _module_importable(python_exe, "pytest_cov")
-        _PYTEST_COV[python_exe] = ok
-    return ok
+    args.append(".")
+    result = _run_docker_text(image, " ".join(args), path, name="pytest", timeout=300)
+    return _prepend_warning(warn, result)
 
 
 def run_type_check(path: str, language: str) -> str:
     """mypy, excluding vendored dirs and silencing missing third-party stubs."""
-    _provision_once(path, "python", _provision)
-    args = [
-        f"--exclude={_vendor_ignore_regex()}",
-        "--ignore-missing-imports",
-        "--no-error-summary",
-        path,
-    ]
-    return _run_python_tool(_venv_python(path), "mypy", args, timeout=300)
+    image, warn = _project_image(path)
+    cmd = (
+        f"mypy --exclude='{_vendor_ignore_regex()}' --ignore-missing-imports "
+        "--no-error-summary ."
+    )
+    result = _run_docker_text(image, cmd, path, name="mypy", timeout=300)
+    return _prepend_warning(warn, result)
 
 
 def check_imports(path: str, language: str) -> str:
-    """Static import health check — broken / unused / circular. No code executed."""
-    return _check_imports_python(path)
+    """Static import health check (broken / unused / circular) — no code executed.
 
-
-# ── static import health check (ast only) ────────────────────────────────
-# Deliberately conservative: when in doubt we DON'T flag, because a false
-# "broken import" is more harmful to a review than a missed one.
-
-def _py_dotted_for(file: Path, root: Path) -> "tuple[str, bool] | None":
-    """Map a .py file to its dotted module path relative to `root`.
-
-    `a/b/c.py` -> ('a.b.c', False); `a/b/__init__.py` -> ('a.b', True). Returns
-    None for a root-level __init__.py (no dotted name to give the root itself).
+    Runs the bundled stdlib AST analyzer inside the dep-installed container so
+    `find_spec` resolves the project's third-party imports (see import_check.py).
     """
-    try:
-        parts = list(file.relative_to(root).parts)
-    except ValueError:
-        return None
-    is_pkg = parts[-1] == "__init__.py"
-    mod_parts = parts[:-1] if is_pkg else parts[:-1] + [parts[-1][:-3]]
-    if not mod_parts:
-        return None
-    return ".".join(mod_parts), is_pkg
+    image, warn = _project_image(path)
+    cmd = "python /checker/import_check.py /work"
+    result = _run_docker_text(image, cmd, path, name="import check", timeout=300,
+                              mounts=[(str(_SCRIPT_DIR), "/checker")])
+    return _prepend_warning(warn, result)
 
 
-def _py_local_index(files: "list[Path]", root: Path) -> tuple:
-    """Build the project's local-module index from the filesystem (no execution).
+# ── compile (byte-compile in Docker) ─────────────────────────────────────
 
-    Returns (file_to_mod, is_pkg_map, importable, top_segments) where `importable`
-    is every local dotted module/package name (incl. all ancestor prefixes) and
-    `top_segments` is the set of their first segments.
+def compile_code(path: str, language: str) -> CompileOutput:
+    """Byte-compile every module via `compileall` in a container — a pure syntax
+    check (no imports executed). Syntax errors come back as ErrorOutputs.
+
+    Uses the plain base image (not the project image) and copy=False — compileall
+    only needs the source files, not the installed deps, and running against /src
+    directly avoids the copy entirely.
     """
-    file_to_mod: dict[Path, str] = {}
-    is_pkg_map: dict[Path, bool] = {}
-    importable: set[str] = set()
-    for f in files:
-        res = _py_dotted_for(f, root)
-        if res is None:
+    dr = _run_docker(_COMPILE_IMAGE, _COMPILE_CMD, path, copy=False,
+                     env={"PYTHONPYCACHEPREFIX": "/tmp/pyc"})
+    errors = _parse_python_compile(dr.output) if dr.error is None else []
+    return _compile_result(dr, language, "compileall", errors, [])
+
+
+def _parse_python_compile(out: str) -> "list[ErrorOutput]":
+    """Pull (file, line, column, message) out of compileall's failure blocks."""
+    lines = out.splitlines()
+    errors: list[ErrorOutput] = []
+    for i, line in enumerate(lines):
+        m = _PY_FILE_RE.search(line)
+        if not m:
             continue
-        dotted, is_pkg = res
-        file_to_mod[f] = dotted
-        is_pkg_map[f] = is_pkg
-        parts = dotted.split(".")
-        for i in range(1, len(parts) + 1):           # add every ancestor prefix
-            importable.add(".".join(parts[:i]))
-    top_segments = {name.split(".")[0] for name in importable}
-    return file_to_mod, is_pkg_map, importable, top_segments
-
-
-def _abs_top_ok(top: str, top_segments: "set[str]", spec_cache: dict) -> bool:
-    """Does the top-level name resolve as local, stdlib, or an installed package?
-
-    Only ever calls find_spec on the bare top-level name — that performs a finder
-    lookup without importing the target, so nothing executes.
-    """
-    if top in top_segments or top in _STDLIB:
-        return True
-    if top in spec_cache:
-        return spec_cache[top]
-    try:
-        ok = importlib.util.find_spec(top) is not None
-    except (ImportError, ValueError, ModuleNotFoundError, AttributeError):
-        ok = False
-    spec_cache[top] = ok
-    return ok
-
-
-def _resolve_relative(cur_mod: str, is_pkg: bool, level: int,
-                      module: "str | None") -> "tuple[str, str, bool]":
-    """Resolve a relative import to (base_pkg, full_target, beyond_top_level)."""
-    parts = cur_mod.split(".")
-    anchor = parts if is_pkg else parts[:-1]      # the importing module's package
-    if level - 1 > len(anchor):
-        return "", "", True
-    base = anchor[: len(anchor) - (level - 1)]
-    target = base + (module.split(".") if module else [])
-    return ".".join(base), ".".join(target), False
-
-
-def _local_target(dotted: str, importable: "set[str]") -> "str | None":
-    """Longest importable prefix of `dotted` that is a local module, or None."""
-    parts = dotted.split(".")
-    for i in range(len(parts), 0, -1):
-        cand = ".".join(parts[:i])
-        if cand in importable:
-            return cand
-    return None
-
-
-def _from_display(node: ast.ImportFrom) -> str:
-    """Render an `ast.ImportFrom` back to source-like text for the report."""
-    prefix = "." * node.level + (node.module or "")
-    names = ", ".join(a.name + (f" as {a.asname}" if a.asname else "")
-                      for a in node.names)
-    return f"from {prefix} import {names}"
-
-
-def _py_find_cycles(graph: "dict[str, set[str]]") -> "list[list[str]]":
-    """Find import cycles via iterative colored DFS; one cycle per SCC, deduped."""
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = {n: WHITE for n in graph}
-    cycles: list[list[str]] = []
-    seen: set[frozenset] = set()
-
-    for start in graph:
-        if color[start] != WHITE:
-            continue
-        color[start] = GRAY
-        stack = [start]
-        work = [(start, iter(sorted(graph[start])))]
-        while work:
-            node, it = work[-1]
-            descended = False
-            for nb in it:
-                if nb not in graph:
-                    continue
-                if color[nb] == WHITE:
-                    color[nb] = GRAY
-                    stack.append(nb)
-                    work.append((nb, iter(sorted(graph[nb]))))
-                    descended = True
-                    break
-                if color[nb] == GRAY:                      # back-edge -> cycle
-                    idx = stack.index(nb)
-                    key = frozenset(stack[idx:])
-                    if key not in seen:
-                        seen.add(key)
-                        cycles.append(stack[idx:] + [nb])
-            if not descended:
-                color[node] = BLACK
-                stack.pop()
-                work.pop()
-    return cycles
-
-
-def _check_imports_python(path: str) -> str:
-    """Static import health check for a Python project: broken / unused / circular."""
-    root = Path(path)
-    if not root.exists():
-        return f"Directory not found: {path}"
-
-    files = [e for e in root.rglob("*.py")
-             if e.is_file() and not (_IGNORE & set(e.relative_to(root).parts))]
-    if not files:
-        return f"No Python files found under {path}."
-
-    file_to_mod, is_pkg_map, importable, top_segments = _py_local_index(files, root)
-
-    broken: list[tuple] = []        # (relpath, lineno, display, reason)
-    unused: list[tuple] = []        # (relpath, lineno, display, bound_name)
-    cannot_parse: list[tuple] = []  # (relpath, lineno, message)
-    graph: dict[str, set[str]] = {mod: set() for mod in file_to_mod.values()}
-    spec_cache: dict[str, bool] = {}
-    star_note = False
-
-    for file in files:
-        relp = _rel(path, str(file))
-        cur_mod = file_to_mod.get(file)
-        is_pkg = is_pkg_map.get(file, False)
-        try:
-            tree = ast.parse(file.read_text(encoding="utf-8", errors="replace"),
-                             filename=str(file))
-        except SyntaxError as e:
-            cannot_parse.append((relp, e.lineno or 0, e.msg))
-            continue
-        except OSError as e:
-            cannot_parse.append((relp, 0, f"could not read file: {e}"))
-            continue
-
-        all_imports = [n for n in ast.walk(tree)
-                       if isinstance(n, (ast.Import, ast.ImportFrom))]
-        top_imports = [n for n in tree.body
-                       if isinstance(n, (ast.Import, ast.ImportFrom))]
-        used = {n.id for n in ast.walk(tree)
-                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-        all_names = _py_dunder_all(tree)
-
-        # ── broken / unresolvable ────────────────────────────────────────
-        for node in all_imports:
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    top = alias.name.split(".")[0]
-                    if not _abs_top_ok(top, top_segments, spec_cache):
-                        broken.append((relp, node.lineno, f"import {alias.name}",
-                                       f"top-level module '{top}' not found "
-                                       "(missing dependency or typo)"))
-            elif node.level == 0:                          # absolute from-import
-                top = (node.module or "").split(".")[0]
-                if node.module and not _abs_top_ok(top, top_segments, spec_cache):
-                    broken.append((relp, node.lineno, _from_display(node),
-                                   f"top-level module '{top}' not found "
-                                   "(missing dependency or typo)"))
-            elif cur_mod is not None:                      # relative from-import
-                base, target, beyond = _resolve_relative(
-                    cur_mod, is_pkg, node.level, node.module)
-                if beyond:
-                    broken.append((relp, node.lineno, _from_display(node),
-                                   "relative import goes beyond the top-level package"))
-                else:
-                    check = target if node.module else base
-                    if check and check not in importable:
-                        broken.append((relp, node.lineno, _from_display(node),
-                                       "relative import does not resolve to a "
-                                       f"project module ('{check}')"))
-
-            # ── circular-import graph edges (local deps only) ────────────
-            if cur_mod is not None:
-                for t in _py_edge_targets(node, cur_mod, is_pkg, importable):
-                    if t != cur_mod:
-                        graph[cur_mod].add(t)
-
-        # ── unused (top-level imports only, to avoid local/typing noise) ──
-        for node in top_imports:
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.asname and alias.asname == alias.name:
-                        continue                            # `import x as x` re-export
-                    bound = alias.asname or alias.name.split(".")[0]
-                    if bound in used or bound in all_names:
-                        continue
-                    disp = f"import {alias.name}" + (
-                        f" as {alias.asname}" if alias.asname else "")
-                    unused.append((relp, node.lineno, disp, bound))
-            else:
-                if node.module == "__future__":
-                    continue
-                for alias in node.names:
-                    if alias.name == "*":
-                        star_note = True
-                        continue
-                    if alias.asname and alias.asname == alias.name:
-                        continue                            # re-export
-                    bound = alias.asname or alias.name
-                    if bound in used or bound in all_names:
-                        continue
-                    disp = (f"from {'.' * node.level}{node.module or ''} "
-                            f"import {alias.name}"
-                            + (f" as {alias.asname}" if alias.asname else ""))
-                    unused.append((relp, node.lineno, disp, bound))
-
-    cycles = _py_find_cycles(graph)
-    return _format_import_report(broken, unused, cycles, cannot_parse, star_note)
-
-
-def _py_dunder_all(tree: ast.Module) -> "set[str]":
-    """Collect string entries of a module-level `__all__` (treated as 'used')."""
-    names: set[str] = set()
-    for node in tree.body:
-        targets = (node.targets if isinstance(node, ast.Assign)
-                   else [node.target] if isinstance(node, ast.AugAssign) else [])
-        if not any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
-            continue
-        value = node.value
-        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
-            for el in value.elts:
-                if isinstance(el, ast.Constant) and isinstance(el.value, str):
-                    names.add(el.value)
-    return names
-
-
-def _py_edge_targets(node, cur_mod: str, is_pkg: bool,
-                     importable: "set[str]") -> "set[str]":
-    """Local module(s) an import depends on, for the circular-import graph."""
-    targets: set[str] = set()
-
-    def add(dotted: str) -> None:
-        t = _local_target(dotted, importable)
-        if t:
-            targets.add(t)
-
-    if isinstance(node, ast.Import):
-        for alias in node.names:
-            add(alias.name)
-    elif node.level == 0:
-        if node.module:
-            add(node.module)
-            for alias in node.names:
-                if alias.name != "*":
-                    add(f"{node.module}.{alias.name}")
-    else:
-        base, target, beyond = _resolve_relative(
-            cur_mod, is_pkg, node.level, node.module)
-        if not beyond:
-            anchor = target if node.module else base
-            if anchor:
-                add(anchor)
-            for alias in node.names:
-                if alias.name != "*" and anchor:
-                    add(f"{anchor}.{alias.name}")
-    return targets
-
-
-def _format_import_report(broken: list, unused: list, cycles: list,
-                          cannot_parse: list, star_note: bool) -> str:
-    """Render the sectioned import-check report, bounded by `_truncate`."""
-    out = ["== IMPORT CHECK (python) =="]
-
-    if broken:
-        out.append(f"\nBROKEN / UNRESOLVABLE ({len(broken)}):")
-        for relp, ln, disp, reason in sorted(broken):
-            out.append(f"  {relp}:{ln}  {disp}  -> {reason}")
-    else:
-        out.append("\nBROKEN / UNRESOLVABLE (0): none found.")
-
-    if unused:
-        out.append(f"\nUNUSED ({len(unused)}):")
-        for relp, ln, disp, bound in sorted(unused):
-            out.append(f"  {relp}:{ln}  {disp}  (name '{bound}' never used)")
-    else:
-        out.append("\nUNUSED (0): none found.")
-
-    if cycles:
-        out.append(f"\nCIRCULAR ({len(cycles)}):  (note: Python tolerates many "
-                   "import cycles at runtime — treat these as warnings)")
-        for cyc in cycles:
-            out.append("  " + " -> ".join(cyc))
-    else:
-        out.append("\nCIRCULAR (0): none found.")
-
-    if cannot_parse:
-        out.append(f"\nCANNOT PARSE ({len(cannot_parse)}):")
-        for relp, ln, msg in sorted(cannot_parse):
-            out.append(f"  {relp}:{ln}  {msg}")
-
-    if star_note:
-        out.append("\n(note: `from x import *` lines are skipped for the unused "
-                   "check — their names can't be tracked statically.)")
-
-    out.append(f"\nSummary: {len(broken)} broken, {len(unused)} unused, "
-               f"{len(cycles)} circular"
-               + (f", {len(cannot_parse)} unparseable" if cannot_parse else "")
-               + ".")
-    return _truncate("\n".join(out))
+        file, lineno = _compile_path(m.group(1)), int(m.group(2))
+        column, message = 0, "SyntaxError"
+        # The caret line (offset column) and the `XxxError: msg` line follow.
+        for nxt in lines[i + 1:i + 6]:
+            stripped = nxt.strip()
+            if stripped and set(stripped) <= {"^", "~"} and column == 0:
+                column = len(nxt) - len(nxt.lstrip()) + 1
+            if _PY_MSG_RE.match(nxt):
+                message = nxt.strip()
+                break
+        errors.append(ErrorOutput(file=file, line=lineno, column=column,
+                                  message=message))
+    return errors

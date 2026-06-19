@@ -38,6 +38,7 @@
         <div id="mode-toggle" class="seg mb-3">
           <button type="button" data-mode="project" class="seg-btn mode-btn">Project</button>
           <button type="button" data-mode="chat" class="seg-btn mode-btn">Chat</button>
+          <button type="button" data-mode="coder" class="seg-btn mode-btn">Coder</button>
         </div>
 
         <!-- Project-only fields: hidden in chat mode (no folder needed). -->
@@ -52,11 +53,27 @@
           <select id="language-select" class="field mb-3"></select>
         </div>
 
-        <label class="field-label block mb-1">Model</label>
-        <select id="model-select" class="field mb-3"></select>
+        <!-- Role + model pickers: hidden in coder mode (driven by graph_config.yaml). -->
+        <div id="role-model-fields">
+          <label class="field-label block mb-1">Model</label>
+          <select id="model-select" class="field mb-3"></select>
 
-        <label class="field-label block mb-1">Role</label>
-        <select id="role-select" class="field mb-3"></select>
+          <label class="field-label block mb-1">Role</label>
+          <select id="role-select" class="field mb-3"></select>
+        </div>
+
+        <!-- Coder-only: optional spec / context file (markdown, text, yaml…). Its
+             text is fed to the orchestrator graph as context_store.spec_content. -->
+        <div id="spec-fields" class="hidden">
+          <label class="field-label block mb-1">
+            Spec file <span style="text-transform:none;letter-spacing:normal;color:var(--text-faint)">· optional</span>
+          </label>
+          <div id="spec-drop" class="spec-drop mb-3">
+            <span id="spec-name" class="spec-drop-text">Drop a .md / .txt / .yaml file, or click to choose</span>
+          </div>
+          <input id="spec-input" type="file" class="hidden"
+                 accept=".md,.markdown,.txt,.text,.yaml,.yml,.rst,.json" />
+        </div>
 
         <button id="start-btn" class="btn btn-primary w-full">Start review</button>
         <p id="new-session-error" class="text-xs mt-2 min-h-4" style="color:var(--danger)"></p>

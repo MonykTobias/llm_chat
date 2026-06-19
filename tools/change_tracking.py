@@ -19,7 +19,7 @@ from langgraph.prebuilt import InjectedState
 
 from structured_output import ReviewState
 
-from ._common import _read_text_or_none, _rel, _safe_path
+from ._common import _read_text_or_none, _rel, _safe_path, _w
 
 _SNAPSHOTS: dict[str, dict[str, "str | None"]] = {}
 _SNAPSHOT_LOCK = threading.RLock()
@@ -69,6 +69,7 @@ def _build_change_report(project_path: str, file_paths: "list[str] | None" = Non
         targets = list(snapshot.keys())
 
     if not targets:
+        _w("ℹ️ No file changes recorded this session — skipping.")
         return "No file changes have been recorded this session."
 
     parts: list[str] = []
