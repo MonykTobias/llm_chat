@@ -395,8 +395,23 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
     returned as a (stopped) `done` event.
     """
     cancel = cancel or threading.Event()
+
+    is_coder = session.get("role") == CODER_ROLE
+
+    # The Coder role is a multi-node planner that runs autonomously to completion;
+    # each user turn is a NEW objective, not a continuation of one chat thread.
+    # Reusing a single thread_id leaks run-scoped state across objectives: the old
+    # `objective` short-circuits scaffold's derivation, `iteration_count`
+    # (operator.add) keeps climbing and can't be reset from input, and sticky
+    # context_store flags (`skip_verification`, `reviewed_at_start`,
+    # `abandoned_tasks`, `task_failure_counts`) poison the next run. So mint a fresh
+    # thread_id per Coder turn — scaffold rebuilds file_tree/exports from disk, so
+    # nothing material is lost. A UUID (not a per-session counter) guarantees the id
+    # never collides with a leftover SQLite checkpoint after a restart. Other roles
+    # keep the stable per-session thread so their conversation memory survives.
+    thread_id = f"{session['id']}#{uuid.uuid4().hex}" if is_coder else session["id"]
     config = {
-        "configurable": {"thread_id": session["id"]},
+        "configurable": {"thread_id": thread_id},
         "recursion_limit": agents._cfg.get("recursion_limit", 1000),
     }
 
@@ -404,7 +419,9 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
     # multimodal blocks, text/PDF files are extracted and embedded inline.
     content = _build_user_content(user_text, attachments)
 
-    if not session.get("started"):
+    # A fresh thread starts with empty state, so the Coder graph needs the full
+    # bootstrap payload (project_path, spec) on EVERY turn — not just the first.
+    if is_coder or not session.get("started"):
         payload = {
             "messages": [{"role": "user", "content": content}],
             "project_path": session["path"],
@@ -412,8 +429,9 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
         }
         # Coder sessions may carry an optional spec file: seed the orchestrator
         # graph's shared store so the scaffold and downstream agents can read it
-        # under context_store["spec_content"]. Only sent on the first turn — it is
-        # persisted in the checkpoint state thereafter (merge_dicts reducer).
+        # under context_store["spec_content"]. Re-sent on every Coder turn because
+        # the fresh thread's store is empty; for other roles it's sent only on the
+        # first turn and persists in the checkpoint thereafter (merge_dicts reducer).
         spec = session.get("spec_content")
         if spec:
             payload["context_store"] = {"spec_content": spec}
@@ -538,6 +556,29 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
                         orch_out_tokens += int(u.get("output_tokens", 0) or 0)
                         orch_peak_input = max(
                             orch_peak_input, int(u.get("input_tokens", 0) or 0))
+                        # Push a running snapshot so the stats meters update live as
+                        # the graph runs, instead of only on the final `done` event.
+                        # Mirrors the `done` aggregation (peak input + summed output)
+                        # and previews the session totals as saved + running.
+                        running = {
+                            "input_tokens": orch_peak_input,
+                            "output_tokens": orch_out_tokens,
+                            "total_tokens": orch_peak_input + orch_out_tokens,
+                        }
+                        t = session["totals"]
+                        live_totals = {
+                            "input_tokens": t["input_tokens"] + running["input_tokens"],
+                            "output_tokens": t["output_tokens"] + running["output_tokens"],
+                            "total_tokens": t["total_tokens"] + running["total_tokens"],
+                            "turns": t["turns"] + 1,
+                        }
+                        emit({
+                            "type": "usage",
+                            "usage": running,
+                            "totals": live_totals,
+                            "context_window": agents._cfg["agents"].get(
+                                session["model"], {}).get("context_window"),
+                        })
                 continue
 
             chunk, _meta = data
@@ -736,6 +777,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # Serve any file under static/ (app modules, css, …), guarding against path
+    # traversal and picking a content type from the extension.
+    _STATIC_TYPES = {
+        ".js":   "application/javascript; charset=utf-8",
+        ".mjs":  "application/javascript; charset=utf-8",
+        ".css":  "text/css; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".svg":  "image/svg+xml",
+    }
+
+    def _serve_static(self, rel: str):
+        target = (STATIC_DIR / rel).resolve()
+        if not target.is_relative_to(STATIC_DIR.resolve()):
+            self._send_json({"error": "not found"}, 404)  # path traversal attempt
+            return
+        ctype = self._STATIC_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        self._send_file(target, ctype)
+
     def _read_body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
         if not length:
@@ -751,11 +811,8 @@ class Handler(BaseHTTPRequestHandler):
         route = self.path.split("?", 1)[0]
         if route == "/":
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
-        elif route == "/static/app.js":
-            self._send_file(STATIC_DIR / "app.js",
-                            "application/javascript; charset=utf-8")
-        elif route == "/static/style.css":
-            self._send_file(STATIC_DIR / "style.css", "text/css; charset=utf-8")
+        elif route.startswith("/static/"):
+            self._serve_static(route[len("/static/"):])
         elif route == "/api/sessions":
             self._send_json({
                 "sessions": sorted(_sessions.values(),

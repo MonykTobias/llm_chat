@@ -62,6 +62,8 @@ def make_llm(cfg: dict) -> ChatOllama:
             kwargs["reasoning"] = True
         # callbacks are handled by langchain (start/end of llm/tools)
         kwargs["callbacks"] = [_StripThinkingCallback()]
+    elif thinking is not None:
+        kwargs["reasoning"] = False
 
     return ChatOllama(**kwargs)
 

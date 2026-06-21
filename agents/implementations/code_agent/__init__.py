@@ -2,17 +2,35 @@
 LangGraph workflow definition for the orchestrator graph.
 
 Flow:
+                          INTAKE
+                            |
                       ORCHESTRATOR
-                     /     |       \\
-              INSPECTOR  ARCHITECT  (complete)
-                  |         |          |
-              ORCHESTRATOR CODER    INSPECTOR (verify)
-                              |      /     \\
-                           VALIDATOR  END  ORCHESTRATOR
+                     /     |      \\  \\
+              INSPECTOR ARCHITECT  SCAFFOLD (complete)
+                  |        |          |        |
+              ORCHESTRATOR CODER  (next_agent) INSPECTOR (verify)
+                              |    architect/    /     \\
+                           VALIDATOR inspector  END  ORCHESTRATOR
                            /     \\
                STEP_DISPATCH   ORCHESTRATOR
                     |
                   CODER  (next step)
+
+Intake (entry point):
+  - Turns the incoming chat turn into the planner `objective` and seeds
+    `language`. This used to live inside the scaffold node; it was split out so
+    the orchestrator (which reads `state["objective"]`) can run *before* scaffold.
+
+Scaffold (now AFTER the orchestrator's first real plan, not before it):
+  - The orchestrator diverts to scaffold exactly once — the first time it emits a
+    plan whose next_agent is a real work agent — so the canonical file tree is
+    built with knowledge of the plan instead of blind. Scaffold then routes on to
+    the agent the plan asked for (architect / inspector).
+  - It runs once by default. If `scaffold_on_replan` is set in graph_config.yaml,
+    a full orchestrator re-plan (task abandoned + re-planned) sets
+    context_store["rescaffold_requested"], diverting through scaffold again in
+    diff mode (it never relocates existing files; it only adds what the new plan
+    needs).
 
 Inspector has two modes:
   - Explore mode: read-only investigation, returns to orchestrator.
@@ -44,14 +62,14 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.constants import START, END
 from langgraph.graph import StateGraph
 
-from agents.sub_agents.code_review.graph.utils.structured_output import AgentState
+from agents.implementations.code_agent.structured_output import AgentState
 from .orchestrator import orchestrator_node, Orchestrator
 from .inspector import inspector_node
 from .architect import architect_node
 from .coder import coder_node
 from .validator import validator_node
-from .scaffold import scaffold_node
-from agents.sub_agents.code_review.graph.utils.step_dispatch import step_dispatch_node
+from .scaffold import scaffold_node, intake_node
+from agents.implementations.code_agent.utils.step_dispatch import step_dispatch_node
 
 __all__ = ["get_app", "Orchestrator"]
 
@@ -64,7 +82,25 @@ MAX_CODER_RETRIES = _cfg.get("coder_max_retries", 3)
 ARCHITECT_RETRY_THRESHOLD = _cfg.get("architect_retry_threshold", 2)
 
 
-def _route_from_orchestrator(state: AgentState) -> Literal["inspector", "architect", "__end__"]:
+def _needs_scaffold(state: AgentState) -> bool:
+    """True when control should be diverted through the scaffold node.
+
+    Two cases:
+      * First run — scaffolding has never happened (the scaffold node stamps
+        context_store["scaffolded"] = True on every one of its return paths,
+        including the skip/empty no-ops, so this flips exactly once).
+      * Re-plan — the orchestrator requested a rescaffold after a full re-plan
+        (only happens when `scaffold_on_replan` is enabled; see orchestrator).
+    """
+    store = state.get("context_store", {}) or {}
+    if not store.get("scaffolded"):
+        return True
+    return bool(store.get("rescaffold_requested"))
+
+
+def _route_from_orchestrator(
+    state: AgentState,
+) -> Literal["scaffold", "inspector", "architect", "__end__"]:
     plan = state.get("plan")
     if not plan:
         return "__end__"
@@ -72,6 +108,25 @@ def _route_from_orchestrator(state: AgentState) -> Literal["inspector", "archite
         # Forced completions (iteration cap / empty LLM) bypass the verifier.
         if state.get("context_store", {}).get("skip_verification"):
             print("\n[Router] Objective complete (verification skipped).")
+            return "__end__"
+        return "inspector"
+    # A real work agent is up next. The first time we reach this point (or when a
+    # re-plan asks for it) we build/refresh the canonical tree first, THEN let the
+    # scaffold node forward control to the planned agent.
+    if _needs_scaffold(state):
+        return "scaffold"
+    return plan.next_agent
+
+
+def _route_from_scaffold(state: AgentState) -> Literal["architect", "inspector", "__end__"]:
+    """Hand control to whatever the orchestrator's plan asked for, now that the
+    canonical tree exists. Mirrors the non-scaffold branches of the orchestrator
+    router so scaffold is a transparent pass-through in the flow."""
+    plan = state.get("plan")
+    if not plan:
+        return "__end__"
+    if plan.next_agent == "complete":
+        if state.get("context_store", {}).get("skip_verification"):
             return "__end__"
         return "inspector"
     return plan.next_agent
@@ -130,6 +185,7 @@ def get_app(dashboard=None, checkpointer: Any = None):
     def node(fn, name):
         return dashboard.wrap(fn, name) if dashboard else fn
 
+    graph.add_node("intake",        node(intake_node,        "intake"))
     graph.add_node("scaffold",      node(scaffold_node,      "scaffold"))
     graph.add_node("orchestrator",  node(orchestrator_node,  "orchestrator"))
     graph.add_node("inspector",     node(inspector_node,     "inspector"))
@@ -138,13 +194,23 @@ def get_app(dashboard=None, checkpointer: Any = None):
     graph.add_node("validator",     node(validator_node,     "validator"))
     graph.add_node("step_dispatch", node(step_dispatch_node, "step_dispatch"))
 
-    # Scaffold runs exactly once (nothing routes back to it), then hands off.
-    graph.add_edge(START, "scaffold")
-    graph.add_edge("scaffold", "orchestrator")
+    # Intake turns the chat turn into an objective, THEN the orchestrator plans.
+    graph.add_edge(START, "intake")
+    graph.add_edge("intake", "orchestrator")
 
+    # Orchestrator diverts to scaffold the first time it dispatches real work
+    # (and on re-plan when scaffold_on_replan is enabled); otherwise straight on.
     graph.add_conditional_edges("orchestrator", _route_from_orchestrator, {
+        "scaffold":  "scaffold",
         "inspector": "inspector",
         "architect": "architect",
+        "__end__":   END,
+    })
+
+    # Scaffold runs, commits the canonical tree, then forwards to the planned agent.
+    graph.add_conditional_edges("scaffold", _route_from_scaffold, {
+        "architect": "architect",
+        "inspector": "inspector",
         "__end__":   END,
     })
 

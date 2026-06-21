@@ -43,16 +43,16 @@ from langgraph.config import get_stream_writer
 
 from agents.llm_factory import make_llm
 
-from agents.sub_agents.code_review.graph.utils.structured_output import (
+from agents.implementations.code_agent.structured_output import (
     AgentState,
     TaskPlan,
     PlannerOutput,
     SubTask,
     REVIEW_TASK_MARKER,
 )
-from agents.sub_agents.code_review.graph.utils.workspace import restore_snapshot, list_workspace_files
-from agents.sub_agents.code_review.graph.utils.validation import extract_paths, on_tree
-from agents.sub_agents.code_review.graph.utils.stats import stats
+from agents.implementations.code_agent.utils.workspace import restore_snapshot, list_workspace_files
+from agents.implementations.code_agent.utils.validation import extract_paths, on_tree
+from agents.implementations.code_agent.utils.stats import stats
 
 # Token-limit recovery is keyed on openai's LengthFinishReasonError. The graph
 # talks to Ollama, so openai may not be installed; degrade gracefully to an empty
@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - openai is optional here
 # Config lives next to this module (graph_config.yaml), not at the CWD root, so
 # the orchestrator graph keeps its own model + prompt set independent of the
 # project's top-level config.yaml.
-_CFG_PATH = Path(__file__).resolve().parent / "graph_config.yaml"
+_CFG_PATH = Path(__file__).resolve().parent.parent / "graph_config.yaml"
 with open(_CFG_PATH, "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 
@@ -74,6 +74,11 @@ MAX_RAW_CHARS = _cfg.get("max_raw_chars", 2000)
 MAX_WORKSPACE_FILES = _cfg.get("max_workspace_files", 120)
 MAX_TASK_ATTEMPTS = _cfg.get("max_task_attempts", 3)
 TASK_RECONSIDERATION_BUDGET = _cfg.get("task_reconsideration_budget", 1)
+# When True, a full re-plan (after a task is abandoned + re-planned) asks the
+# scaffold node to re-run in diff mode so the canonical tree covers any new files
+# the fresh plan introduced. Default False = scaffold runs exactly once, right
+# after the first plan. The scaffold node clears the request flag when it runs.
+SCAFFOLD_ON_REPLAN = _cfg.get("scaffold_on_replan", False)
 
 
 def _parse_plan_fallback(raw_content: str) -> PlannerOutput | None:
@@ -553,12 +558,9 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
             raise
 
     if result.get("raw"):
+        # record_tokens both accumulates the run total and pushes this call's usage
+        # onto the custom stream so the UI's live stats meters update mid-run.
         stats.record_tokens(result["raw"])
-        # Surface this call's token usage on the custom channel. The server can't
-        # see the graph's internal model calls
-        usage = getattr(result["raw"], "usage_metadata", None) or {}
-        if usage.get("output_tokens") or usage.get("input_tokens"):
-            writer({"kind": "usage", "usage": usage})
 
     planner_out = result["parsed"]
 
@@ -706,6 +708,12 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         return_context["workspace_files"] = restored_ws
     if restored_exports is not None:
         return_context["module_exports"] = restored_exports
+    # Opt-in: once the tree already exists, a fresh full plan may need new files.
+    # Ask the scaffold node to re-run in diff mode. Guarded on `scaffolded` so the
+    # very first plan (scaffold hasn't run yet) doesn't set this — the router still
+    # diverts to scaffold then via its not-yet-scaffolded branch.
+    if SCAFFOLD_ON_REPLAN and state.get("context_store", {}).get("scaffolded"):
+        return_context["rescaffold_requested"] = True
     return {
         "plan": new_plan,
         "iteration_count": 1,
@@ -750,7 +758,7 @@ class Orchestrator:
         # Lazy import avoids a circular import: this module is imported BY the
         # package __init__ (where get_app lives), so we only reach in for get_app
         # at instantiation time, after the package has finished importing.
-        from agents.sub_agents.code_review.graph import get_app
+        from agents.implementations.code_agent import get_app
 
         self._model_configs = model_configs
         self._recursion_limit = recursion_limit

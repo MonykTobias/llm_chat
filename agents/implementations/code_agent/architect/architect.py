@@ -25,10 +25,11 @@ from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolNode
 
 from agents.llm_factory import make_llm
+from agents.implementations.code_agent.utils.llm_helpers import _is_ollama_xml_bug, _scrub
 from tools import list_workspace_files, read_file, list_all_files, analyze_architecture
 
-from agents.sub_agents.code_review.graph.utils.structured_output import AgentState, ArchitectOutput, ArchitectStep
-from agents.sub_agents.code_review.graph.utils.stats import stats
+from agents.implementations.code_agent.structured_output import AgentState, ArchitectOutput, ArchitectStep
+from agents.implementations.code_agent.utils.stats import stats
 
 ARCHITECT_TOOLS = [
     read_file,
@@ -38,7 +39,7 @@ ARCHITECT_TOOLS = [
 
 MAX_TOOL_ITERS = 15
 
-_CFG_PATH = Path(__file__).resolve().parent / "graph_config.yaml"
+_CFG_PATH = Path(__file__).resolve().parent.parent / "graph_config.yaml"
 with open(_CFG_PATH, "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 
@@ -106,6 +107,7 @@ def architect_node(state: AgentState, config: RunnableConfig) -> dict:
     _w(f"### 📐 Architect{'  — re-plan after **' + str(retries) + '** failed attempt(s)' if is_replan else ''}\n\n**Task:** {instruction[:]}")
 
     arch_cfg = _cfg["agents"]["architect"]
+    arch_tool_cfg = {**arch_cfg, **_cfg["agents"].get("architect_tools", {})}
     # Feed the model the real, current file listing instead of relying on it to call tools
     file_tree = "\n".join(f"  {p}" for p in list_workspace_files(project_path)) or "  (empty project)"
     inspector_findings = store.get("inspector_raw") or "No prior exploration found."
@@ -137,8 +139,8 @@ def architect_node(state: AgentState, config: RunnableConfig) -> dict:
             "Produce a genuinely different plan — do not repeat the failed approach.</replan>"
         )
 
-    tool_llm = make_llm(arch_cfg).bind_tools(ARCHITECT_TOOLS)
-    structured_llm = make_llm(arch_cfg).with_structured_output(ArchitectOutput, include_raw=True)
+    tool_llm = make_llm(arch_tool_cfg).bind_tools(ARCHITECT_TOOLS)
+    structured_llm = (make_llm(arch_cfg).with_structured_output(ArchitectOutput, include_raw=True, method="json_schema"))
     tool_executor = ToolNode(ARCHITECT_TOOLS,handle_tool_errors=False)
     messages: list[BaseMessage] = [HumanMessage(content=system_prompt)]
 
@@ -149,27 +151,43 @@ def architect_node(state: AgentState, config: RunnableConfig) -> dict:
 
     try:
         for _ in range(MAX_TOOL_ITERS):
-            ai_msg = tool_llm.invoke(messages)
+            try:
+                ai_msg = tool_llm.invoke(messages)
+            except Exception as e:
+                if _is_ollama_xml_bug(e):
+                    _w("⚠️ Ollama tool-call parse failed; planning from context gathered so far.")
+                    break  # degrade → go straight to the plan
+                _w(f"tool_llm.invoke failed: {e!r}")
+                raise
+
             messages.append(ai_msg)
-            if ai_msg.tool_calls:
-                tool_result = tool_executor.invoke(
-                    {**state, "messages": messages},
-                    config=config,
-                )
-                messages.extend(tool_result["messages"])
-            else:
-                messages.append(HumanMessage(content=plan_prompt))
-                result = structured_llm.invoke(messages)
-                if result.get("raw"):
-                    stats.record_tokens(result["raw"])
-                parsed = result["parsed"]
-                if parsed is None and result.get("raw"):
-                    raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
-                    parsed = _parse_architect_fallback(raw_text)
+            stats.record_tokens(ai_msg)  # count + live-emit each tool-loop call
+
+            if not ai_msg.tool_calls:
                 break
+
+            tool_result = tool_executor.invoke(
+                {**state, "messages": messages},
+                config=config,
+            )
+            for m in tool_result["messages"]:  # scrub file contents before re-feeding
+                if isinstance(m.content, str):
+                    m.content = _scrub(m.content)
+            messages.extend(tool_result["messages"])
+
         else:
-            _w(f"❌ Architect exceeded max tool iterations ({MAX_TOOL_ITERS}).")
-            raise RuntimeError("Architect exceeded max tool iterations")
+            _w(f"⚠️ Architect hit max tool iterations ({MAX_TOOL_ITERS}); planning with current context.")
+
+
+        messages.append(HumanMessage(content=plan_prompt))
+        result = structured_llm.invoke(messages)
+        if result.get("raw"):
+            stats.record_tokens(result["raw"])
+        parsed = result["parsed"]
+        if parsed is None and result.get("raw"):
+            raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
+            parsed = _parse_architect_fallback(raw_text)
+
     except Exception as e:
         msg = f"[FAILED] Architect could not generate a plan: {e}"
         _w(f"❌ Architect could not generate a plan: `{e}`")

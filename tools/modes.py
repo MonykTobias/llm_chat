@@ -36,13 +36,13 @@ def set_language(language: str, *,
     # so subsequent tools in the same loop see the updated language immediately.
     if isinstance(state, dict):
         state["language"] = new
-        return f"Language changed from {old} to {new}."
+        return f"Language changed to {new}."
 
     # Inside the real graph executor — use Command to update graph state properly.
     return Command(update={
         "language": new,
         "messages": [ToolMessage(
-            content=f"Language changed from {old} to {new}.",
+            content=f"Language changed to {new}.",
             tool_call_id=tool_call_id,
         )],
     })

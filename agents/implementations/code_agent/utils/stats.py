@@ -12,6 +12,8 @@ the planner logic in `orchestrator.py` keeps the same token-accounting hooks.
 import os
 import time
 
+from langgraph.config import get_stream_writer
+
 
 class WorkflowStats:
     def __init__(self):
@@ -75,6 +77,25 @@ class WorkflowStats:
             self.output_tokens += out
             self.last_input_tokens = inp
             self.last_output_tokens = out
+            self._emit_usage(inp, out)
+
+    @staticmethod
+    def _emit_usage(inp: int, out: int) -> None:
+        """Push this single LLM call's usage onto the graph's custom stream so the
+        UI's stats meters update live, mid-run — not only when the whole graph
+        finishes. get_stream_writer() only resolves inside a streaming run (it is a
+        no-op / raises during plain .invoke or tests), so guard it defensively.
+        """
+        try:
+            writer = get_stream_writer()
+        except Exception:
+            writer = None
+        if writer is None:
+            return
+        writer({"kind": "usage",
+                "usage": {"input_tokens": inp,
+                          "output_tokens": out,
+                          "total_tokens": inp + out}})
 
     def format_tokens(self, count: int) -> str:
         if count >= 1_000_000:

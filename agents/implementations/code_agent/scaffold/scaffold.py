@@ -1,16 +1,17 @@
 """
-Scaffold node — graph entry point.
+Scaffold node — canonical-file-tree builder, now running AFTER the orchestrator's
+first plan (it used to be the graph entry point, before any planning).
 
-Two jobs, both now implemented:
+The chat-turn → objective INTAKE that used to live here as "job 1" has been split
+into `intake_node` (also in this module), which runs at START so the orchestrator
+— which reads `state["objective"]` — has it before it plans. `scaffold_node` is
+now diverted to by the orchestrator the first time it dispatches real work, so the
+tree is built with the plan in hand rather than blind. See this package's
+`__init__.py` flow docstring for the wiring.
 
-  1. INTAKE: the UI server streams a chat payload — {"messages":
-     [{role, content}], "project_path", "language", ...} — exactly as it does for
-     every other role. The planner runs on a single `objective` string, so this
-     node derives the objective from the latest user message when one isn't passed
-     explicitly. This is what lets the graph be wired into the frontend with no
-     server changes: scaffold is the bridge from chat turn → objective.
+This node's single job:
 
-  2. SCAFFOLD: commit ONE canonical project file tree into
+  1. SCAFFOLD: commit ONE canonical project file tree into
      context_store["file_tree"] before any planning starts. It reads the spec
      (if any), the real files on disk under `state["project_path"]`, and a
      spec-seeded hint tree, then writes the final canonical list every downstream
@@ -29,7 +30,14 @@ config sandbox dir), the real file listing comes from `tools.list_workspace_file
 per-node LLM/prompt config lives in `graph_config.yaml`, and the objective intake
 above is preserved.
 
-Runs exactly once (nothing routes back to it), then hands off to the orchestrator.
+Idempotency: the node stamps context_store["scaffolded"] = True on every return
+path (including the skip/empty no-ops), so the orchestrator router diverts here
+exactly once. If `scaffold_on_replan` is enabled, a full orchestrator re-plan sets
+context_store["rescaffold_requested"] and control is diverted here again; the
+reconciliation below is inherently a diff (it always re-includes the existing
+workspace files and the prior tree as the seed), so a re-run only ADDS what the
+new plan needs and never relocates existing files. After running, scaffold forwards
+to the agent the plan named (architect / inspector).
 """
 from __future__ import annotations
 
@@ -46,11 +54,12 @@ from langgraph.config import get_stream_writer
 from agents.llm_factory import make_llm
 from tools import list_workspace_files, safe_read
 
-from agents.sub_agents.code_review.graph.utils.structured_output import AgentState, ScaffoldOutput
-from agents.sub_agents.code_review.graph.utils.stats import stats
+from agents.implementations.code_agent.structured_output import AgentState, ScaffoldOutput
+from agents.implementations.code_agent.utils.stats import stats
+from agents.implementations.code_agent.utils.validation import extract_paths
 
 # Config lives next to this module (graph_config.yaml), like every other node.
-_CFG_PATH = Path(__file__).resolve().parent / "graph_config.yaml"
+_CFG_PATH = Path(__file__).resolve().parent.parent / "graph_config.yaml"
 with open(_CFG_PATH, "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 
@@ -70,6 +79,11 @@ _SOURCE_EXTS = {
     ".c", ".cc", ".cpp", ".h", ".hpp",
 }
 
+# Stamped into context_store on EVERY scaffold return path so the orchestrator
+# router (`_needs_scaffold`) diverts here exactly once. `rescaffold_requested` is
+# cleared here so a re-plan-triggered re-run consumes the request and doesn't loop.
+_SCAFFOLD_DONE_FLAGS = {"scaffolded": True, "rescaffold_requested": False}
+
 
 def _derive_objective(state: AgentState) -> str:
     """Latest user message text, used as the planner objective."""
@@ -79,6 +93,78 @@ def _derive_objective(state: AgentState) -> str:
             content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
             return content if isinstance(content, str) else str(content)
     return ""
+
+
+def intake_node(state: AgentState, config: RunnableConfig) -> dict:
+    """Entry node: turn the incoming chat turn into the planner objective.
+
+    Split out of the old scaffold node so it can run at START, *before* the
+    orchestrator (which reads `state["objective"]`). It is intentionally tiny:
+    no LLM, no disk access, no file tree. If the caller already supplied an
+    explicit `objective` we keep it; otherwise we derive it from the latest user
+    message — exactly as scaffold used to. `language` is passed through with a
+    sane default so downstream nodes that read it still see a value.
+    """
+    writer = get_stream_writer()
+    objective = state.get("objective") or _derive_objective(state)
+    writer({"kind": "stage", "stage": "intake",
+            "label": "📥 Intake — reading the request"})
+    return {
+        "objective": objective,
+        "language": state.get("language", "python"),
+        "history": ["intake"],
+    }
+
+
+def _format_planned_tasks(plan) -> str:
+    """Render the orchestrator's current plan as a short bullet list for the
+    scaffold prompt, so the tree is shaped by the work that's actually planned.
+
+    Returns "" when there is no usable plan, so callers can fall back to the
+    objective-only prompt unchanged.
+    """
+    if plan is None:
+        return ""
+    lines: list[str] = []
+    head = getattr(plan, "instruction_for_agent", "") or ""
+    head_agent = getattr(plan, "next_agent", "") or "agent"
+    if head.strip():
+        lines.append(f"  - [{head_agent}] {head.strip()}")
+    for t in (getattr(plan, "todo_list", None) or []):
+        instr = getattr(t, "instruction", "") or ""
+        agent = getattr(t, "agent", "") or "agent"
+        if instr.strip():
+            lines.append(f"  - [{agent}] {instr.strip()}")
+    return "\n".join(lines)
+
+
+def _plan_referenced_paths(plan) -> list[str]:
+    """Every file path the orchestrator's plan names, normalized and de-duped.
+
+    These are force-included in the canonical tree so a planned-but-not-yet-created
+    file (e.g. 'backend/models/session.py' from a 'create ...' task) is guaranteed
+    to be on the tree. That keeps the tree a superset of what the plan references,
+    so later grounding (`_sanitize_todo`) can never drop a legitimate create-task,
+    and the inspector reports such files as missing-to-implement rather than ignoring
+    them. Uses the same `extract_paths` the orchestrator trusts for sanitizing.
+    """
+    if plan is None:
+        return []
+    texts: list[str] = []
+    head = getattr(plan, "instruction_for_agent", "") or ""
+    if head.strip():
+        texts.append(head)
+    for t in (getattr(plan, "todo_list", None) or []):
+        instr = getattr(t, "instruction", "") or ""
+        if instr.strip():
+            texts.append(instr)
+    out: list[str] = []
+    for text in texts:
+        for p in extract_paths(text):
+            np = _norm(p)
+            if np and not _is_junk(np) and np not in out:
+                out.append(np)
+    return out
 
 
 def _parse_scaffold_fallback(raw_content: str) -> ScaffoldOutput | None:
@@ -341,6 +427,7 @@ def scaffold_node(state: AgentState, config: RunnableConfig) -> dict:
         return {
             "objective": objective,
             "language": state.get("language", "python"),
+            "context_store": dict(_SCAFFOLD_DONE_FLAGS),
             "history": ["scaffold_skipped"]
         }
 
@@ -361,6 +448,7 @@ def scaffold_node(state: AgentState, config: RunnableConfig) -> dict:
         return {
             "objective": objective,
             "language": state.get("language", "python"),
+            "context_store": dict(_SCAFFOLD_DONE_FLAGS),
             "history": ["scaffold_skipped"]
         }
 
@@ -370,8 +458,22 @@ def scaffold_node(state: AgentState, config: RunnableConfig) -> dict:
     llm = make_llm(sc)
 
     workspace_dirs = _derive_dirs(workspace_files)
+
+    # Scaffold now runs after the orchestrator's first plan, so fold the planned
+    # tasks into the objective the tree-builder sees. This is what lets the tree be
+    # shaped by the actual work instead of guessed blind. We enrich only the prompt
+    # copy; state["objective"] itself is left untouched.
+    planned_tasks = _format_planned_tasks(state.get("plan"))
+    objective_for_tree = objective
+    if planned_tasks:
+        objective_for_tree = (
+            f"{objective}\n\n"
+            f"PLANNED TASKS (the implementation plan this file tree must support):\n"
+            f"{planned_tasks}"
+        )
+
     prompt = Template(_cfg["prompts"]["scaffold"]).safe_substitute(
-        objective=objective,
+        objective=objective_for_tree,
         sandbox_name=project_name or "(project root)",
         spec=spec_content or "(no spec provided)",
         workspace_files="\n".join(f"  {p}" for p in workspace_files) or "(empty workspace)",
@@ -403,16 +505,29 @@ def scaffold_node(state: AgentState, config: RunnableConfig) -> dict:
 
     model_files = [_norm(f) for f in parsed.files] if parsed else []
 
-    # Reconcile: the tree MUST contain every existing workspace file (never relocate)
-    # and every spec-required path, on top of whatever the model proposed.
+    # Paths the plan explicitly names — force-included so no planned file can be
+    # left off the tree (and thus grounded away later). Weaker than workspace files
+    # (real on disk) but treated as anchors so they survive double-root collapse.
+    plan_paths = _plan_referenced_paths(state.get("plan"))
+
+    # Reconcile: the tree MUST contain every existing workspace file (never relocate),
+    # every spec-required path, and every path the plan references, on top of whatever
+    # the model proposed.
     files: list[str] = []
-    for f in model_files + [_norm(p) for p in workspace_files] + [_norm(p) for p in seed]:
+    for f in model_files + [_norm(p) for p in workspace_files] + [_norm(p) for p in seed] + plan_paths:
         if f and not _is_junk(f) and f not in files:
             files.append(f)
 
+    forced = [p for p in plan_paths if p not in model_files
+              and p not in {_norm(x) for x in workspace_files}]
+    if forced:
+        _w(f"📌 Force-included **{len(forced)}** plan-referenced path(s) not proposed by the tree LLM.")
+
     # Collapse any accidental double root (e.g. 'backend/x' vs 'wrapper/backend/x').
-    # Existing workspace + spec-required paths are the authoritative forms.
-    anchors = {_norm(p) for p in workspace_files} | {_norm(p) for p in seed}
+    # Existing workspace + spec-required + plan-referenced paths are authoritative forms.
+    anchors = ({_norm(p) for p in workspace_files}
+               | {_norm(p) for p in seed}
+               | set(plan_paths))
     before = len(files)
     files = _collapse_double_root(files, anchors)
     if len(files) < before:
@@ -434,7 +549,8 @@ def scaffold_node(state: AgentState, config: RunnableConfig) -> dict:
         return {
             "objective": objective,
             "language": state.get("language", "python"),
-            "context_store": {"workspace_files": workspace_files, "workspace_dirs": workspace_dirs},
+            "context_store": {"workspace_files": workspace_files, "workspace_dirs": workspace_dirs,
+                              **_SCAFFOLD_DONE_FLAGS},
             "history": ["scaffold_empty"],
         }
 
@@ -480,6 +596,7 @@ def scaffold_node(state: AgentState, config: RunnableConfig) -> dict:
         "workspace_files": workspace_files,
         "workspace_dirs": workspace_dirs,
         "module_exports_planned": planned_interfaces,
+        **_SCAFFOLD_DONE_FLAGS,
     }
     if confirmed_exports:
         ctx["module_exports"] = confirmed_exports

@@ -25,12 +25,13 @@ from langgraph.config import get_stream_writer
 from langgraph.prebuilt import ToolNode
 
 from agents.llm_factory import make_llm
-from tools import safe_read, safe_write, safe_delete, list_workspace_files, read_file
+from agents.implementations.code_agent.utils.llm_helpers import _is_ollama_xml_bug, _scrub
+from tools import safe_write, safe_delete, list_workspace_files, read_file
 
-from agents.sub_agents.code_review.graph.utils.structured_output import AgentState, CoderOutput, FileChange
-from agents.sub_agents.code_review.graph.utils.stats import stats
+from agents.implementations.code_agent.structured_output import AgentState, CoderOutput, FileChange
+from agents.implementations.code_agent.utils.stats import stats
 
-_CFG_PATH = Path(__file__).resolve().parent / "graph_config.yaml"
+_CFG_PATH = Path(__file__).resolve().parent.parent / "graph_config.yaml"
 with open(_CFG_PATH, "r", encoding="utf-8") as f:
     _cfg = yaml.safe_load(f)
 
@@ -115,10 +116,12 @@ def coder_node(state: AgentState, config: RunnableConfig) -> dict:
         required_exports="",  # stripped: no module-export registry
     )
 
-    tool_llm = (make_llm(_cfg["agents"]["coder"])
-                .bind_tools(CODER_TOOLS))
-    structured_llm = ((make_llm(_cfg["agents"]["coder"]))
-                      .with_structured_output(CoderOutput, include_raw=True))
+    coder_cfg = _cfg["agents"]["coder"]
+    coder_tool_cfg = {**coder_cfg, **_cfg["agents"].get("coder_tools", {})}
+
+    tool_llm = make_llm(coder_tool_cfg).bind_tools(CODER_TOOLS)
+    structured_llm = ((make_llm(coder_cfg))
+                      .with_structured_output(CoderOutput, include_raw=True, method="json_schema"))
     tool_executor = ToolNode(CODER_TOOLS, handle_tool_errors=False)
     messages: list[BaseMessage] = [HumanMessage(content=prompt)]
 
@@ -134,25 +137,42 @@ def coder_node(state: AgentState, config: RunnableConfig) -> dict:
 
     try:
         for _ in range(MAX_TOOL_ITERS):
-            ai_msg = tool_llm.invoke(messages)
+            try:
+                ai_msg = tool_llm.invoke(messages)
+            except Exception as e:
+                if _is_ollama_xml_bug(e):
+                    _w("⚠️ Ollama tool-call parse failed; planning from context gathered so far.")
+                    break  # degrade → go straight to the plan
+                _w(f"tool_llm.invoke failed: {e!r}")
+                raise
+
             messages.append(ai_msg)
-            if ai_msg.tool_calls:
-                tool_result = tool_executor.invoke(
-                    {**state, "messages": messages},
-                    config=config,
-                )
-                messages.extend(tool_result["messages"])
-            else:
-                messages.append(HumanMessage(content=code_prompt))
-                result = structured_llm.invoke(messages)
-                parsed = result["parsed"]
-                if parsed is None and result.get("raw"):
-                    raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
-                    parsed = _parse_coder_fallback(raw_text)
+            stats.record_tokens(ai_msg)  # count + live-emit each tool-loop call
+
+            if not ai_msg.tool_calls:
                 break
+
+            tool_result = tool_executor.invoke(
+                {**state, "messages": messages},
+                config=config,
+            )
+            for m in tool_result["messages"]:
+                if isinstance(m.content, str):
+                    m.content = _scrub(m.content)
+            messages.extend(tool_result["messages"])
+
         else:
             _w(f"❌ Coder exceeded max tool iterations ({MAX_TOOL_ITERS}).")
-            raise RuntimeError("Architect exceeded max tool iterations")
+        messages.append(HumanMessage(content=code_prompt))
+        result = structured_llm.invoke(messages)
+        if result.get("raw"):
+            stats.record_tokens(result["raw"])
+        parsed = result["parsed"]
+
+        if parsed is None and result.get("raw"):
+            raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
+            parsed = _parse_coder_fallback(raw_text)
+
     except Exception as e:
         msg = f"[FAILED] Coder could not generate output: {e}"
         _w(f"❌ Coder could not generate output: `{e}`")

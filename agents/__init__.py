@@ -28,12 +28,12 @@ import yaml
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from agents.base import BaseAgent
-from agents.sub_agents.code_review.cr_act import CodeReviewAct
-from agents.sub_agents.code_review.cr_explore import CodeReviewExplore
-from agents.sub_agents.code_review.cr_plan import CodeReviewPlan
-from agents.sub_agents.code_review.cr_verify import CodeReviewVerify
-from agents.sub_agents.code_review_agent import CodeReviewAgent
-from agents.sub_agents.texting_agent import TextingAgent
+from agents.implementations.assistant_agent.cr_act import CodeReviewAct
+from agents.implementations.assistant_agent.cr_explore import CodeReviewExplore
+from agents.implementations.assistant_agent.cr_plan import CodeReviewPlan
+from agents.implementations.assistant_agent.cr_verify import CodeReviewVerify
+from agents.implementations.default.code_review_agent import CodeReviewAgent
+from agents.implementations.chat_agent.texting_agent import TextingAgent
 
 __all__ = [
     "BaseAgent",
@@ -103,7 +103,7 @@ AGENTS: dict[str, BaseAgent] = {
 # drives the four stage agents. It needs them already built, so it is wired AFTER
 # the comprehension with direct references (no lazy lookup, no import cycle). Its
 # config.yaml `prompt:` entry exists only so the UI lists the role.
-from agents.sub_agents.code_review.graph import Orchestrator as CodeReviewGraph
+from agents.implementations.code_agent import Orchestrator as CodeReviewGraph
 
 AGENTS["code-assistant"] = CodeReviewGraph(
     _cfg["agents"],

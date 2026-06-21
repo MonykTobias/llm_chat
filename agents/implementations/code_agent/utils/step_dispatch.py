@@ -11,7 +11,7 @@ from __future__ import annotations
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
-from agents.sub_agents.code_review.graph.utils.structured_output import AgentState
+from agents.implementations.code_agent.structured_output import AgentState
 
 def step_dispatch_node(state: AgentState, config: RunnableConfig) -> dict:
     writer = get_stream_writer() # frontend-provided stream writer
