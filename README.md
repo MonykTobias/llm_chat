@@ -4,9 +4,16 @@ A local-first coding assistant with a browser UI for reviewing, explaining, plan
 
 ## Screenshots
 
-### Code Review
+### Code Review Agent
+
+The code review workflow analyzes generated or submitted code, performs syntax and validation checks, and provides structured feedback on detected issues.
+
 ![screenshot_code_review.png](assets/screenshot_code_review.png)
-### Chat
+
+### Chat with Web Search
+
+The chat interface can use web search to retrieve up-to-date information when answering queries, such as current weather conditions.
+
 ![screenshot_chat.png](assets/screenshot_chat.png)
 
 ## Features
@@ -38,7 +45,7 @@ Docker is used by the language tooling to run linters, tests, compilers, and imp
 
 ```bash
 git clone <repository-url>
-cd code_review_agent
+cd local-code-review-agent
 python -m venv .venv
 ```
 
