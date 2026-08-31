@@ -144,7 +144,7 @@ def _route_from_inspector(state: AgentState) -> Literal["orchestrator", "__end__
     return "orchestrator"
 
 
-def _route_from_architect(state: AgentState) -> Literal["coder", "orchestrator"]:
+def _route_from_architect(state: AgentState) -> Literal["coder", "validator","orchestrator"]:
     report = state.get("latest_report", "")
     if report.startswith("[FAILED]"):
         return "orchestrator"
@@ -152,6 +152,8 @@ def _route_from_architect(state: AgentState) -> Literal["coder", "orchestrator"]
         # No-op: task already satisfied. Skip the coder and let the orchestrator
         # record it as done and plan the next task.
         return "orchestrator"
+    if report.startswith("[COMPLETE_VALIDATE]"):
+        return "validator"
     return "coder"
 
 
@@ -221,6 +223,7 @@ def get_app(dashboard=None, checkpointer: Any = None):
 
     graph.add_conditional_edges("architect", _route_from_architect, {
         "coder":        "coder",
+        "validator": "validator",
         "orchestrator": "orchestrator",
     })
 

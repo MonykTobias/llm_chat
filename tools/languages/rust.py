@@ -101,23 +101,34 @@ def check_imports(path: str, language: str) -> str:
                      path, timeout=300)
     if dr.error is not None:
         return _prepend_warning(warn, dr.error)
-    broken, unused = _parse_rust_imports(dr.output)
+    broken, unresolved_ext, unused = _parse_rust_imports(dr.output)
     return _prepend_warning(warn, format_report(
         "rust", broken, unused, [],
         circular_note=("Rust's module system has no import cycles; crate-level "
-                       "cycles are prevented by Cargo.")))
+                       "cycles are prevented by Cargo."),
+        unresolved_ext=unresolved_ext))
 
 
 _BT_RE = re.compile(r"`([^`]+)`")
+# Path roots that resolve to local/std code rather than an external crate.
+_RS_LOCAL_ROOTS = {"crate", "self", "super", "std", "core", "alloc"}
 
 
-def _parse_rust_imports(out: str) -> "tuple[list, list]":
-    """Pull (broken, unused) out of `cargo check --message-format=json` output.
+def _parse_rust_imports(out: str) -> "tuple[list, list, list]":
+    """Pull (broken, unresolved_ext, unused) out of `cargo check
+    --message-format=json` output.
+
+    An unresolved import rooted at the local crate/std (`crate::`, `self::`,
+    `std::`, …) is a real broken local reference and stays in `broken`. An
+    undeclared external crate (E0433 "use of undeclared crate or module", or any
+    other root) is a missing-dependency advisory, not a code defect, so it goes to
+    `unresolved_ext`.
 
     Diagnostics whose primary span points into the crate registry (a dependency,
     not the reviewed code) are skipped so the report stays about this project.
     """
     broken: list[tuple] = []
+    unresolved_ext: list[tuple] = []
     unused: list[tuple] = []
     for line in out.splitlines():
         line = line.strip()
@@ -145,12 +156,22 @@ def _parse_rust_imports(out: str) -> "tuple[list, list]":
         lineno = prim.get("line_start", 0)
         if code in ("E0432", "E0433") or text.startswith("unresolved import"):
             m = _BT_RE.search(text)
-            disp = f"use {m.group(1)}" if m else "unresolved import"
-            broken.append((file, lineno, disp, text))
+            path = m.group(1) if m else ""
+            disp = f"use {path}" if path else "unresolved import"
+            root = path.split("::", 1)[0] if path else ""
+            is_external = (
+                "use of undeclared crate or module" in text
+                or (bool(root) and root not in _RS_LOCAL_ROOTS)
+            )
+            if is_external and root:
+                unresolved_ext.append((file, lineno, disp,
+                                       f"crate '{root}' not declared in Cargo.toml"))
+            else:
+                broken.append((file, lineno, disp, text))
         elif code == "unused_imports" or text.startswith("unused import"):
             for name in (_BT_RE.findall(text) or [""]):
                 unused.append((file, lineno, f"use {name}".strip(), name))
-    return broken, unused
+    return broken, unresolved_ext, unused
 
 
 def compile_code(path: str, language: str) -> CompileOutput:

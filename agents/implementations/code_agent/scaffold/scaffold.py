@@ -109,9 +109,21 @@ def intake_node(state: AgentState, config: RunnableConfig) -> dict:
     objective = state.get("objective") or _derive_objective(state)
     writer({"kind": "stage", "stage": "intake",
             "label": "📥 Intake — reading the request"})
+
+    # populate project_path with existing paths
+    project_path = state.get("project_path", ".")
+    try:
+        workspace_files = list_workspace_files(project_path)
+    except Exception:
+        workspace_files = []
+
+
     return {
         "objective": objective,
         "language": state.get("language", "python"),
+        "context_store" : {
+            "workspace_files": workspace_files,
+        },
         "history": ["intake"],
     }
 

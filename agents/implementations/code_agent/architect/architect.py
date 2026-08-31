@@ -29,7 +29,11 @@ from agents.implementations.code_agent.utils.llm_helpers import _is_ollama_xml_b
 from tools import list_workspace_files, read_file, list_all_files, analyze_architecture
 
 from agents.implementations.code_agent.structured_output import AgentState, ArchitectOutput, ArchitectStep
+# NOTE: ArchitectOutput must include an optional `validate_existing: bool = False` field
+# so the architect can signal "task complete, run validator on existing files" without
+# going through the coder.  Add it to the Pydantic model in structured_output.py.
 from agents.implementations.code_agent.utils.stats import stats
+from agents.implementations.code_agent.utils.stream_helpers import stream_tool_calls
 
 ARCHITECT_TOOLS = [
     read_file,
@@ -73,7 +77,12 @@ def _parse_architect_fallback(raw_content: str) -> ArchitectOutput | None:
     if not isinstance(plan_text, str):
         return None
     if data.get("task_complete"):
-        return ArchitectOutput(plan=plan_text, steps=[], task_complete=True)
+        return ArchitectOutput(
+            plan=plan_text,
+            steps=[],
+            task_complete=True,
+            validate_existing=bool(data.get("validate_existing", False)),
+        )
 
     steps = []
     for s in data.get("steps", []):
@@ -86,6 +95,23 @@ def _parse_architect_fallback(raw_content: str) -> ArchitectOutput | None:
                 files_to_delete=_as_file_list(s.get("files_to_delete")),
             ))
     return ArchitectOutput(plan=plan_text, steps=steps) if steps else None
+
+
+def _invoke_structured_plan(structured_llm, messages) -> ArchitectOutput | None:
+    """Run the structured-output call and apply the best-effort fallback parse.
+
+    Returns the parsed ArchitectOutput (or None if neither the structured call
+    nor the fallback produced anything usable). Records token usage as a side
+    effect.
+    """
+    result = structured_llm.invoke(messages)
+    if result.get("raw"):
+        stats.record_tokens(result["raw"])
+    parsed = result["parsed"]
+    if parsed is None and result.get("raw"):
+        raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
+        parsed = _parse_architect_fallback(raw_text)
+    return parsed
 
 
 def architect_node(state: AgentState, config: RunnableConfig) -> dict:
@@ -140,12 +166,76 @@ def architect_node(state: AgentState, config: RunnableConfig) -> dict:
         )
 
     tool_llm = make_llm(arch_tool_cfg).bind_tools(ARCHITECT_TOOLS)
-    structured_llm = (make_llm(arch_cfg).with_structured_output(ArchitectOutput, include_raw=True, method="json_schema"))
-    tool_executor = ToolNode(ARCHITECT_TOOLS,handle_tool_errors=False)
+    # Two-call split for the plan itself:
+    #   1. reasoner — thinking ON, free text. Does the hard planning out loud.
+    #   2. formatter — thinking OFF, json_schema.
+    reasoner_llm = make_llm(arch_cfg)
+    formatter_cfg = {**arch_cfg, "thinking": False}
+    structured_llm = make_llm(formatter_cfg).with_structured_output(
+        ArchitectOutput, include_raw=True, method="json_schema"
+    )
+    tool_executor = ToolNode(ARCHITECT_TOOLS, handle_tool_errors=False)
+
+    # inject real content for every file that already exists ──
+    existing_file_contents: dict[str, str] = {}
+    workspace_paths = set(list_workspace_files(project_path))
+    for ws_path in workspace_paths:
+        # Only read files whose path is referenced (even partially) in the task.
+        if ws_path in instruction or ws_path.split("/")[-1] in instruction:
+            try:
+                content = read_file(ws_path, project_path)
+                if content and not content.startswith("FILE DOES NOT EXIST"):
+                    existing_file_contents[ws_path] = content
+            except Exception:
+                pass
+
+    if existing_file_contents:
+        preflight_block = "\n\n<existing_file_contents description=\"" \
+            "Current on-disk content for files this task touches — " \
+            "use this to decide CREATE (absent) vs MODIFY (present, needs changes) " \
+            "vs task_complete (fully satisfies the task already)\">\n"
+        for path, content in existing_file_contents.items():
+            scrubbed = _scrub(content)
+            preflight_block += f"<file path=\"{path}\">\n{scrubbed}\n</file>\n"
+        preflight_block += "</existing_file_contents>"
+        system_prompt += preflight_block
+        _w(f"📂 Pre-read **{len(existing_file_contents)}** existing file(s): "
+           f"{', '.join(f'`{p}`' for p in existing_file_contents)}")
+
     messages: list[BaseMessage] = [HumanMessage(content=system_prompt)]
 
-    plan_prompt = (
-        "You have gathered enough context. Now produce your structured implementation plan."
+    # Pass 1 — reasoning (thinking ON). Ask for a thorough prose plan, no JSON yet.
+    reason_prompt = (
+        "You have gathered enough context. Think through the full implementation plan "
+        "for this task and write it out as prose — NOT JSON yet.\n\n"
+        "FILE CLASSIFICATION — apply this for every file this task concerns:\n"
+        "  • NOT in <existing_file_contents> (absent from disk) → it will be CREATED.\n"
+        "  • Present in <existing_file_contents> AND needs any change → it will be MODIFIED.\n"
+        "    An existing file is NEVER recreated from scratch.\n\n"
+        "Decide whether the task is already fully satisfied by the existing code. It is "
+        "only 'already done' when you can point to SPECIFIC lines in "
+        "<existing_file_contents> that implement every requirement. When in doubt, plan "
+        "the work.\n\n"
+        "If work is needed, lay out an ORDERED list of small steps. For EACH step state: "
+        "the target file, whether the step creates or modifies it, the exact functions / "
+        "methods / changes it makes (with signatures), and the import path + symbol names "
+        "of any dependency it relies on. Keep each step small (~2-4 functions). This prose "
+        "plan is the source the next step turns into JSON, so be concrete and complete."
+    )
+
+    # Pass 2 — formatting (thinking OFF). Convert the prose plan into ArchitectOutput.
+    format_prompt = (
+        "Now convert the plan you just wrote into the structured ArchitectOutput JSON.\n\n"
+        "Rules for the conversion:\n"
+        "  • Each planned step → one entry in 'steps' with a detailed step_plan and "
+        "exactly ONE non-empty file list (files_to_create OR files_to_modify OR "
+        "files_to_delete).\n"
+        "  • Existing files go in files_to_modify, never files_to_create.\n"
+        "  • Unless the task is already fully satisfied, 'steps' MUST contain at least "
+        "one step. An empty 'steps' with task_complete=false is INVALID.\n"
+        "  • Only if the existing code already fully satisfies the task: set "
+        "task_complete=true, validate_existing=true, and leave 'steps' empty.\n"
+        "Emit ONLY the JSON object — no prose, no markdown, no commentary."
     )
     parsed = None
 
@@ -174,19 +264,38 @@ def architect_node(state: AgentState, config: RunnableConfig) -> dict:
                 if isinstance(m.content, str):
                     m.content = _scrub(m.content)
             messages.extend(tool_result["messages"])
+            # Announce the reads ourselves — the inline ToolNode's results never
+            # reach the UI server's "messages" stream (see stream_helpers).
+            stream_tool_calls(writer, ai_msg.tool_calls)
 
         else:
             _w(f"⚠️ Architect hit max tool iterations ({MAX_TOOL_ITERS}); planning with current context.")
 
 
-        messages.append(HumanMessage(content=plan_prompt))
-        result = structured_llm.invoke(messages)
-        if result.get("raw"):
-            stats.record_tokens(result["raw"])
-        parsed = result["parsed"]
-        if parsed is None and result.get("raw"):
-            raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
-            parsed = _parse_architect_fallback(raw_text)
+        # ── Pass 1: reasoning (thinking ON, free text) ──
+        messages.append(HumanMessage(content=reason_prompt))
+        reasoning = reasoner_llm.invoke(messages)
+        stats.record_tokens(reasoning)
+        messages.append(reasoning)  # the prose plan becomes context for the formatter
+
+        # ── Pass 2: formatting (thinking OFF, json_schema) ──
+        messages.append(HumanMessage(content=format_prompt))
+        parsed = _invoke_structured_plan(structured_llm, messages)
+
+        # Defensive retry: if the formatter still returns an empty `steps` array
+        # without claiming task_complete (invalid), re-ask it once, forcefully.
+        if parsed is not None and not parsed.task_complete and not parsed.steps:
+            _w("⚠️ Formatted plan had no steps; re-requesting a concrete step list.")
+            messages.append(HumanMessage(content=(
+                "Your previous JSON set task_complete=false but returned an empty "
+                "'steps' array — that is invalid. Re-emit the ArchitectOutput JSON "
+                "with AT LEAST ONE concrete step drawn from the plan you wrote above. "
+                "Each step needs a detailed step_plan and exactly one non-empty file "
+                "list. Emit ONLY the JSON object."
+            )))
+            retry = _invoke_structured_plan(structured_llm, messages)
+            if retry is not None and (retry.steps or retry.task_complete):
+                parsed = retry
 
     except Exception as e:
         msg = f"[FAILED] Architect could not generate a plan: {e}"
@@ -198,10 +307,38 @@ def architect_node(state: AgentState, config: RunnableConfig) -> dict:
         _w("❌ Architect produced no usable output.")
         return {"latest_report": msg, "history": ["architect_failed"]}
 
-    # Legitimate no-op: task already satisfied. '[COMPLETE]' routes back to the
-    # orchestrator (and is NOT '[FAILED]', so it records as done).
+    # Legitimate no-op: task already satisfied.
+    # Two sub-cases:
+    #   validate_existing=True  → the files exist and look complete, but we still
+    #                             want the validator to run linting/type-checks on
+    #                             them.  Route '[COMPLETE_VALIDATE]' so the graph
+    #                             sends control to the validator directly.
+    #   validate_existing=False → genuinely nothing to do; skip straight back to
+    #                             the orchestrator (old '[COMPLETE]' behaviour).
     if parsed.task_complete:
         reason = (parsed.plan or "Task already satisfied; no changes required.").strip()
+        if getattr(parsed, "validate_existing", False):
+            # Populate context_store so the validator knows which files to check.
+            target_files = list(existing_file_contents.keys())
+            _w(f"✅ Already implemented — sending to validator: {reason[:]}")
+            return {
+                "latest_report": f"[COMPLETE_VALIDATE] {reason[:]}",
+                "history": ["architect_noop_validate"],
+                "coder_retries": 0,
+                "architect_replans": 0,
+                "architect_step_queue": [],
+                "context_store": {
+                    **state.get("context_store", {}),
+                    "architect_plan": reason,
+                    "architect_files_to_create": [],
+                    "architect_files_to_modify": target_files,
+                    "architect_files_to_delete": [],
+                    "validation_issues": "",
+                    "coder_latest_files": {
+                        "current": target_files,
+                    },
+                },
+            }
         _w(f"✅ No changes needed: {reason[:]}")
         return {
             "latest_report": f"[COMPLETE] {reason[:]}",
@@ -212,7 +349,8 @@ def architect_node(state: AgentState, config: RunnableConfig) -> dict:
         }
 
     if not parsed.steps:
-        msg = "[FAILED] Architect produced no steps."
+        plan_hint = (parsed.plan or "").strip()
+        msg = f"[FAILED] Architect produced no steps. Intended plan: {plan_hint[:300]}"
         _w("❌ Architect produced no steps.")
         return {"latest_report": msg, "history": ["architect_failed"]}
 

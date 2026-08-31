@@ -26,6 +26,8 @@ from agents.implementations.code_agent.inspector.utils import (
     _workspace_listing,
     _classify_file_claims,
     _to_issue,
+    _parse_review_fallback,
+    _review_is_degenerate,
 )
 
 
@@ -61,10 +63,19 @@ def review(state: AgentState, config: RunnableConfig, project_path: str,
         workspace_files=workspace_files,
     )
 
+    reason_prompt = (
+        "You have finished reviewing. Think through your verdict and write it as prose "
+        "— NOT JSON yet. State whether the project satisfies the spec and file tree, and "
+        "list the concrete evidence: which canonical files are missing, which spec-required "
+        "files are absent from the tree, and which existing files have content problems "
+        "(placeholders, broken imports, spec violations). Be specific with paths so the "
+        "next step can turn this into a structured verdict without losing anything."
+    )
+
     verdict_prompt = (
-        "You have finished your review. Based on your investigation, produce a structured "
-        "review verdict. List any missing files, new files needed, and issues found. "
-        "Set verdict to 'pass' only if the project fully satisfies the spec and file tree."
+        "Now convert your review into the structured ReviewOutput JSON. List any missing "
+        "files, new files needed, and issues found. Set verdict to 'pass' only if the "
+        "project fully satisfies the spec and file tree. Emit ONLY the JSON object."
     )
 
     messages: list[BaseMessage] = [HumanMessage(content=system_prompt)]
@@ -73,7 +84,10 @@ def review(state: AgentState, config: RunnableConfig, project_path: str,
 
     try:
         parsed = run_tool_loop(
-            messages, work, config, ReviewOutput, verdict_prompt, _w
+            messages, work, config, ReviewOutput, verdict_prompt, _w,
+            reason_prompt=reason_prompt,
+            fallback_parser=_parse_review_fallback,
+            is_degenerate=_review_is_degenerate,
         )
     except Exception as e:
         msg = f"[FAILED] Inspector review crashed: {e}"

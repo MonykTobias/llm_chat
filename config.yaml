@@ -95,6 +95,24 @@ agents:
     max_tokens: 32768
     thinking: false
 
+  glm-4.7-flash:
+    model: "glm-4.7-flash:latest"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 262144
+    max_tokens: 32768
+    thinking: true
+
+  gemma4:27b:
+    model: "gemma4:27b"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 262144
+    max_tokens: 32768
+    thinking: true
+
 prompt:
   code-review: |
     <role>

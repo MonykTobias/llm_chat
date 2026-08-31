@@ -107,9 +107,12 @@ def run_linter(path: str, language: str) -> str:
     # matches it against the basename of each dir during its recursive os.walk);
     # every _IGNORE entry is already a plain dir basename.
     image, warn = _project_image(path)
+    # import-error / no-name-in-module are disabled to match the import-check's
+    # policy: an unresolved third-party import usually means the check environment
+    # lacks the project's deps, not a code defect — flagging it is a false positive.
     cmd = (
         f"pylint --recursive=y --ignore={','.join(sorted(_IGNORE))} "
-        "--jobs=0 --disable=duplicate-code ."
+        "--jobs=0 --disable=duplicate-code,import-error,no-name-in-module ."
     )
     result = _run_docker_text(image, cmd, path, name="pylint", timeout=300)
     return _prepend_warning(warn, result)

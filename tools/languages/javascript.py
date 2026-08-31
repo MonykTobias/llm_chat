@@ -197,7 +197,7 @@ def check_imports(path: str, language: str) -> str:
         return _prepend_warning(warn, dr.error)
     dep_blob, _, unused_blob = dr.output.partition("<<<UNUSED>>>")
     dep_blob = dep_blob.partition("<<<DEPCRUISE>>>")[2]
-    broken, cycles, orphans = _parse_depcruise(dep_blob)
+    broken, unresolved_ext, cycles, orphans = _parse_depcruise(dep_blob)
     unused = (_parse_tsc_unused(unused_blob, path) if is_ts
               else _parse_eslint_unused(unused_blob, path))
     notes: list[str] = []
@@ -205,7 +205,8 @@ def check_imports(path: str, language: str) -> str:
         shown = ", ".join(orphans[:20]) + (" …" if len(orphans) > 20 else "")
         notes.append(f"ORPHAN MODULES ({len(orphans)}): {shown}  — files not "
                      "imported anywhere (possible dead code).")
-    return _prepend_warning(warn, format_report(language, broken, unused, cycles, notes))
+    return _prepend_warning(warn, format_report(language, broken, unused, cycles, notes,
+                                                unresolved_ext=unresolved_ext))
 
 
 # ── dependency-cruiser output parsing ────────────────────────────────────
@@ -218,29 +219,45 @@ def _depcruise_cycle(violation: dict) -> "list[str]":
     return [x for x in out if x]
 
 
-def _parse_depcruise(blob: str) -> "tuple[list, list, list]":
-    """Pull (broken, cycles, orphans) out of dependency-cruiser JSON."""
+def _is_local_specifier(spec: str) -> bool:
+    """True for a relative/absolute path import (`./x`, `../x`, `/x`); False for a
+    bare specifier (`vite`, `@vitejs/plugin-react`), which is an external npm package."""
+    return spec.startswith((".", "/"))
+
+
+def _parse_depcruise(blob: str) -> "tuple[list, list, list, list]":
+    """Pull (broken, unresolved_ext, cycles, orphans) out of dependency-cruiser JSON.
+
+    An unresolvable *bare* specifier is a third-party package missing from the check
+    environment, not a code defect — it goes to `unresolved_ext` (non-failing
+    advisory). An unresolvable *relative* import is a real broken local reference and
+    stays in `broken`."""
     broken: list[tuple] = []
+    unresolved_ext: list[tuple] = []
     cycles: list[list[str]] = []
     orphans: list[str] = []
     blob = blob.strip()
     if not blob:
-        return broken, cycles, orphans
+        return broken, unresolved_ext, cycles, orphans
     try:
         data = json.loads(blob)
     except ValueError:
-        return broken, cycles, orphans
+        return broken, unresolved_ext, cycles, orphans
     for v in ((data.get("summary") or {}).get("violations") or []):
         rule = (v.get("rule") or {}).get("name")
         frm, to = v.get("from", ""), v.get("to", "")
         if rule == "no-unresolvable":
-            broken.append((frm, 0, f"import '{to}'", f"unresolvable module '{to}'"))
+            if _is_local_specifier(to):
+                broken.append((frm, 0, f"import '{to}'", f"unresolvable module '{to}'"))
+            else:
+                unresolved_ext.append((frm, 0, f"import '{to}'",
+                                       f"external module '{to}' not installed here"))
         elif rule == "no-circular":
             chain = _depcruise_cycle(v)
             cycles.append([frm] + chain if chain else [frm, to])
         elif rule == "no-orphans":
             orphans.append(frm)
-    return broken, cycles, orphans
+    return broken, unresolved_ext, cycles, orphans
 
 
 _ESLINT_NAME_RE = re.compile(r"^'([^']+)'")

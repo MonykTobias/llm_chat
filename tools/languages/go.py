@@ -104,8 +104,9 @@ def check_imports(path: str, language: str) -> str:
     dr = _run_docker(image, "go build ./...", path, timeout=300)
     if dr.error is not None:
         return _prepend_warning(warn, dr.error)
-    broken, unused, cycles = _parse_go_imports(dr.output)
-    return _prepend_warning(warn, format_report("go", broken, unused, cycles))
+    broken, unresolved_ext, unused, cycles = _parse_go_imports(dr.output)
+    return _prepend_warning(warn, format_report("go", broken, unused, cycles,
+                                                unresolved_ext=unresolved_ext))
 
 
 # ── go build output parsing ───────────────────────────────────────────────
@@ -126,9 +127,18 @@ _GO_PKG_RE = re.compile(r"^package (\S+)$")
 _GO_IMPORTS_RE = re.compile(r"^\s+imports (\S+?)(: import cycle not allowed)?$")
 
 
-def _parse_go_imports(out: str) -> "tuple[list, list, list]":
-    """Split `go build` output into (broken, unused, cycles) for the report."""
+def _is_external_go_pkg(pkg_path: str) -> bool:
+    """True for a third-party module path whose first segment is a domain
+    (e.g. 'github.com/...', 'golang.org/x/...', 'gopkg.in/...'). A dot-less first
+    segment is either a stdlib package or a local module subpackage, so it is NOT
+    treated as external."""
+    return "." in pkg_path.split("/", 1)[0]
+
+
+def _parse_go_imports(out: str) -> "tuple[list, list, list, list]":
+    """Split `go build` output into (broken, unresolved_ext, unused, cycles)."""
     broken: list[tuple] = []
+    unresolved_ext: list[tuple] = []
     unused: list[tuple] = []
     cycles: list[list[str]] = []
     chain: list[str] = []
@@ -162,8 +172,17 @@ def _parse_go_imports(out: str) -> "tuple[list, list, list]":
         mm = _GO_MISSING_RE.search(msg)
         if mm:
             pkg_path = mm.group(1) or mm.group(2) or mm.group(3)
-            broken.append((file, lineno, f'import "{pkg_path}"', msg))
-    return broken, unused, cycles
+            # group(3) = "no required module provides package" → the module is not
+            # declared in go.mod; a domain-style path is likewise third-party.
+            # Either case is a non-failing advisory (undeclared dependency), not a
+            # broken local reference — a dot-less, non-stdlib path is a likely
+            # local/stdlib typo and stays BROKEN.
+            if mm.group(3) or _is_external_go_pkg(pkg_path):
+                unresolved_ext.append((file, lineno, f'import "{pkg_path}"',
+                                       f"module providing '{pkg_path}' not declared in go.mod"))
+            else:
+                broken.append((file, lineno, f'import "{pkg_path}"', msg))
+    return broken, unresolved_ext, unused, cycles
 
 
 def compile_code(path: str, language: str) -> CompileOutput:

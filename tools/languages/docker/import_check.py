@@ -241,8 +241,8 @@ def _py_edge_targets(node, cur_mod: str, is_pkg: bool,
     return targets
 
 
-def _format_import_report(broken: list, unused: list, cycles: list,
-                          cannot_parse: list, star_note: bool) -> str:
+def _format_import_report(broken: list, unresolved_ext: list, unused: list,
+                          cycles: list, cannot_parse: list, star_note: bool) -> str:
     """Render the sectioned import-check report, bounded by `_truncate`."""
     out = ["== IMPORT CHECK (python) =="]
 
@@ -252,6 +252,14 @@ def _format_import_report(broken: list, unused: list, cycles: list,
             out.append(f"  {relp}:{ln}  {disp}  -> {reason}")
     else:
         out.append("\nBROKEN / UNRESOLVABLE (0): none found.")
+
+    if unresolved_ext:
+        out.append(f"\nUNRESOLVED THIRD-PARTY ({len(unresolved_ext)}) — NOT a failure: "
+                   "these top-level packages aren't installed in the check "
+                   "environment (likely an undeclared/uninstalled dependency, not a "
+                   "code defect). Verify the name only if it looks misspelled.")
+        for relp, ln, disp, top in sorted(unresolved_ext):
+            out.append(f"  {relp}:{ln}  {disp}  (package '{top}' not installed here)")
 
     if unused:
         out.append(f"\nUNUSED ({len(unused)}):")
@@ -279,6 +287,8 @@ def _format_import_report(broken: list, unused: list, cycles: list,
 
     out.append(f"\nSummary: {len(broken)} broken, {len(unused)} unused, "
                f"{len(cycles)} circular"
+               + (f", {len(unresolved_ext)} unresolved third-party (advisory)"
+                  if unresolved_ext else "")
                + (f", {len(cannot_parse)} unparseable" if cannot_parse else "")
                + ".")
     return _truncate("\n".join(out))
@@ -308,6 +318,7 @@ def check_imports(path: str) -> str:
     file_to_mod, is_pkg_map, importable, top_segments = _py_local_index(files, root)
 
     broken: list[tuple] = []        # (relpath, lineno, display, reason)
+    unresolved_ext: list[tuple] = []  # (relpath, lineno, display, top_name)
     unused: list[tuple] = []        # (relpath, lineno, display, bound_name)
     cannot_parse: list[tuple] = []  # (relpath, lineno, message)
     graph: dict[str, set[str]] = {mod: set() for mod in file_to_mod.values()}
@@ -341,16 +352,19 @@ def check_imports(path: str) -> str:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     top = alias.name.split(".")[0]
+                    # An unresolved ABSOLUTE/third-party top-level name is reported
+                    # as a non-failing advisory, not BROKEN: find_spec can't tell a
+                    # correct-but-uninstalled package (the common case when the check
+                    # environment lacks the project's deps) from a typo, and a false
+                    # "broken import" is more harmful to a review than a missed one.
                     if not _abs_top_ok(top, top_segments, spec_cache):
-                        broken.append((relp, node.lineno, f"import {alias.name}",
-                                       f"top-level module '{top}' not found "
-                                       "(missing dependency or typo)"))
+                        unresolved_ext.append((relp, node.lineno,
+                                               f"import {alias.name}", top))
             elif node.level == 0:                          # absolute from-import
                 top = (node.module or "").split(".")[0]
                 if node.module and not _abs_top_ok(top, top_segments, spec_cache):
-                    broken.append((relp, node.lineno, _from_display(node),
-                                   f"top-level module '{top}' not found "
-                                   "(missing dependency or typo)"))
+                    unresolved_ext.append((relp, node.lineno,
+                                           _from_display(node), top))
             elif cur_mod is not None:                      # relative from-import
                 base, target, beyond = _resolve_relative(
                     cur_mod, is_pkg, node.level, node.module)
@@ -400,7 +414,8 @@ def check_imports(path: str) -> str:
                     unused.append((relp, node.lineno, disp, bound))
 
     cycles = _py_find_cycles(graph)
-    return _format_import_report(broken, unused, cycles, cannot_parse, star_note)
+    return _format_import_report(broken, unresolved_ext, unused, cycles,
+                                 cannot_parse, star_note)
 
 
 if __name__ == "__main__":

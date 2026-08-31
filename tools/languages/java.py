@@ -204,10 +204,11 @@ def check_imports(path: str, language: str) -> str:
     compile_out, _, rest = dr.output.partition("<<<UNUSED>>>")
     compile_out = compile_out.partition("<<<COMPILE>>>")[2]
     unused_out, _, cycles_out = rest.partition("<<<CYCLES>>>")
-    broken = _parse_java_broken(compile_out, path)
+    broken, unresolved_ext = _parse_java_broken(compile_out, path)
     unused = _parse_checkstyle_unused(unused_out)
     cycles = _parse_jdeps_cycles(cycles_out)
-    return _prepend_warning(warn, format_report("java", broken, unused, cycles))
+    return _prepend_warning(warn, format_report("java", broken, unused, cycles,
+                                                unresolved_ext=unresolved_ext))
 
 
 def _is_import_line(project_path: str, rel: str, line: int,
@@ -221,10 +222,61 @@ def _is_import_line(project_path: str, rel: str, line: int,
     return src if src.strip().startswith("import ") else None
 
 
-def _parse_java_broken(out: str, project_path: str) -> "list[tuple]":
-    """Unresolved imports from compile output: missing packages / import lines."""
+def _project_packages(project_path: str) -> "set[str]":
+    """Up-to-2-segment package prefixes the project itself defines, derived from
+    the source-tree layout (e.g. 'src/main/java/com/myapp/foo/Bar.java' ->
+    'com.myapp'). Used to tell a missing OWN package (real defect) from a missing
+    THIRD-PARTY package (undeclared dependency → advisory). Empty when the layout
+    gives no signal (default-package only), which forces the safe fallback."""
+    base = Path(project_path) / "src" / "main" / "java"
+    if not base.is_dir():
+        base = Path(project_path)
+    roots: set[str] = set()
+    try:
+        for p in base.rglob("*.java"):
+            parts = p.relative_to(base).parts[:-1]  # package dirs, drop filename
+            if parts:
+                roots.add(".".join(parts[:2]))
+    except OSError:
+        pass
+    return roots
+
+
+def _imported_package(src: str) -> str:
+    """Package portion of a Java import statement line, '' if not parseable.
+    'import static com.foo.Bar.baz;' / 'import com.foo.*;' -> 'com.foo'."""
+    s = src.strip().rstrip(";").strip()
+    if s.startswith("import"):
+        s = s[len("import"):].strip()
+    if s.startswith("static"):
+        s = s[len("static"):].strip()
+    parts = s.split(".")
+    return ".".join(parts[:-1]) if len(parts) >= 2 else s
+
+
+def _java_is_external(pkg: str, own: "set[str]") -> bool:
+    """A missing import package is third-party (advisory) unless it's a JDK package
+    or part of the project's own source. Empty pkg or empty own-set → NOT external
+    (fall back to treating it as a real error, so we never hide a genuine defect)."""
+    if not pkg:
+        return False
+    if pkg.split(".", 1)[0] in ("java", "javax", "jakarta"):
+        return False
+    if not own:
+        return False
+    return not any(pkg == r or pkg.startswith(r + ".") for r in own)
+
+
+def _parse_java_broken(out: str, project_path: str) -> "tuple[list, list]":
+    """Unresolved imports from compile output, split into (broken, unresolved_ext).
+
+    A missing package under the project's own source roots is a real broken local
+    reference (BROKEN); a missing third-party / non-JDK package is an undeclared
+    dependency (non-failing advisory). See `_java_is_external`."""
     broken: list[tuple] = []
+    unresolved_ext: list[tuple] = []
     cache: dict[str, list[str]] = {}
+    own = _project_packages(project_path)
     for line in out.splitlines():
         stripped = line.strip()
         m = _MAVEN_RE.match(stripped)
@@ -240,14 +292,21 @@ def _parse_java_broken(out: str, project_path: str) -> "list[tuple]":
         file, ln, msg = _compile_path(file), int(ln), msg.strip()
         # "package x does not exist" is always an import problem; "cannot find
         # symbol" only counts when the offending line is an import statement.
-        if "does not exist" in msg:
-            src = _is_import_line(project_path, file, ln, cache)
-            broken.append((file, ln, src.strip() if src else msg, msg))
-        elif "cannot find symbol" in msg:
-            src = _is_import_line(project_path, file, ln, cache)
-            if src:
-                broken.append((file, ln, src.strip(), msg))
-    return broken
+        is_missing_pkg = "does not exist" in msg
+        is_cannot_find = "cannot find symbol" in msg
+        if not (is_missing_pkg or is_cannot_find):
+            continue
+        src = _is_import_line(project_path, file, ln, cache)
+        if is_cannot_find and not src:
+            continue  # a non-import "cannot find symbol" is not an import problem
+        disp = src.strip() if src else msg
+        pkg = _imported_package(src) if src else ""
+        if _java_is_external(pkg, own):
+            unresolved_ext.append((file, ln, disp,
+                                   f"package '{pkg}' not found — undeclared dependency?"))
+        else:
+            broken.append((file, ln, disp, msg))
+    return broken, unresolved_ext
 
 
 # Checkstyle:  [WARN] /work/Foo.java:5:1: Unused import - java.util.List. [UnusedImports]

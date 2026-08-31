@@ -36,7 +36,8 @@ _REPLACE_KEYS = {
     "inspector_issues",  # issues found from ExploreOutput
     "explore_summary",
     "explore_files",
-    "explore_issues"
+    "explore_issues",
+    "tests_generated",  # one-shot flag: autogen test tasks already enqueued
 }
 
 
@@ -129,6 +130,12 @@ class ArchitectOutput(BaseModel):
         description="Set true ONLY when the task is already fully satisfied by the "
                     "existing code and no file changes are needed. When true, 'steps' "
                     "must be empty and 'plan' must explain why no work is required.",
+    )
+    validate_existing: bool = Field(
+        default=False,
+        description="Set true to validate the existing code against the objective. "
+                    "This is a separate step because it can be skipped if the objective "
+                    "is already fully satisfied by the existing code.",
     )
 
 

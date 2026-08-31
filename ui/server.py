@@ -273,7 +273,7 @@ _TEXT_MIMES = {
     "application/javascript", "application/typescript", "application/x-sh",
     "application/x-python", "application/sql",
 }
-_MAX_ATTACH_TEXT_CHARS = 20_000  # per-file cap so a huge paste can't blow the context
+_MAX_ATTACH_TEXT_CHARS = 20000000  # per-file cap so a huge paste can't blow the context
 
 
 def _data_url_bytes(data_url: str) -> "bytes | None":
@@ -591,13 +591,18 @@ def _run_turn(session: dict, user_text: str, emit, attachments: "list | None" = 
             }
 
             if is_graph_node:
-                # Only let tool-related chunks through — drop raw text content
-                is_tool_chunk = isinstance(chunk, AIMessageChunk) and bool(chunk.tool_call_chunks)
-                is_tool_result = isinstance(chunk, ToolMessage)
-                if not is_tool_chunk and not is_tool_result:
-                    continue
-            # Full AIMessage (non-streaming) with tool calls — graph nodes deliver these
-            # as complete messages rather than chunks, so register IDs here too.
+                # Graph nodes drive the ENTIRE UI through the "custom" channel
+                # handled above (text, stage, usage, and their own tool_start/
+                # tool_end events). We deliberately do NOT derive tool bubbles from
+                # their native message stream: their tool loops run an inline
+                # ToolNode whose ToolMessages never reach this stream, so a
+                # tool_start could be seen here but its matching tool_end never
+                # could — which is exactly what left spinners stuck. Drop all of
+                # it; the node's own tool_start/tool_end events are authoritative.
+                continue
+            # Full AIMessage (non-streaming) with tool calls: a native (non-graph)
+            # agent that returns a complete tool-calling message rather than token
+            # chunks. Register IDs and open the bubble here too.
             if isinstance(chunk, AIMessage) and not isinstance(chunk, AIMessageChunk):
                 for tc in (chunk.tool_calls or []):
                     name = tc.get("name", "")

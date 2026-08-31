@@ -19,6 +19,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Callable, Optional
 
 import yaml
 from langchain_core.messages import HumanMessage, BaseMessage
@@ -29,6 +30,7 @@ from langgraph.prebuilt import ToolNode
 from agents.llm_factory import make_llm
 from agents.implementations.code_agent.utils.llm_helpers import _is_ollama_xml_bug, _scrub
 from agents.implementations.code_agent.utils.stats import stats
+from agents.implementations.code_agent.utils.stream_helpers import stream_tool_calls
 from structured_output import LANGUAGES
 from tools import (
     analyze_architecture,
@@ -52,6 +54,11 @@ with open(_CFG_PATH, "r", encoding="utf-8") as f:
 
 inspector_config = _cfg["agents"]["inspector"]
 inspector_tool_config = {**inspector_config, **_cfg["agents"].get("inspector_tools", {})}
+# Formatter config for the structured pass: thinking OFF. Mirrors the architect's
+# split — the reasoning pass (thinking on) produces a prose verdict, then this
+# thinking-off call only converts it to the schema. Keeps thinking and
+# json_schema constrained decoding from fighting over the token budget.
+inspector_format_config = {**inspector_config, "thinking": False}
 
 DEFAULT_REVIEW_TOOLS = [
     read_file,
@@ -66,7 +73,7 @@ DEFAULT_REVIEW_TOOLS = [
     set_language,
 ]
 
-MAX_TOOL_ITERS = 30
+MAX_TOOL_ITERS = 100
 
 
 def make_writer():
@@ -86,23 +93,51 @@ def run_tool_loop(
     output_schema,
     verdict_prompt: str,
     write,
+    reason_prompt: Optional[str] = None,
+    fallback_parser: Optional[Callable[[str], object]] = None,
+    is_degenerate: Optional[Callable[[object], bool]] = None,
 ):
-    """Drive the Validator's Pattern: a ReAct tool loop, then one structured call.
+    """Drive the Validator's Pattern: a ReAct tool loop, then a two-pass verdict.
 
-    Two LLMs are used — one bound to the read-only tools for the loop, one with
-    structured output for the final verdict. Mutates `messages` (and `work`,
-    whose "language" is updated when the model calls `set_language`) in place and
-    returns the parsed structured-output object (may be None if parsing failed).
+    Three LLMs are used:
+      * tool_llm   — bound to the read-only tools, drives the ReAct loop.
+      * reasoner   — thinking ON, free text. Writes the verdict reasoning as prose.
+      * structured — thinking OFF, json_schema. Converts that prose to `output_schema`.
+
+    The two-pass split mirrors the architect: thinking + constrained json_schema
+    decoding fight over the token budget and the model can close the grammar
+    early with a degenerate (e.g. empty) result. Reasoning happens in the prose
+    pass; the structured pass only formats.
+
+    Optional hooks (each mode passes its own; all default to prior behaviour):
+      * reason_prompt    — the prose-pass instruction. Defaults to a generic
+                           "reason through your verdict" derived from verdict_prompt.
+      * fallback_parser  — parse the raw text when structured parsing returns None.
+      * is_degenerate    — return True when a parsed result is invalid and the
+                           structured pass should be retried once, more forcefully.
+
+    Mutates `messages` (and `work`, whose "language" is updated when the model
+    calls `set_language`) in place and returns the parsed structured-output
+    object (may be None if parsing and fallback both fail).
 
     Raises on a genuine tool-call failure (other than the tolerated Ollama XML
     bug, which degrades to "plan from context gathered so far"); callers wrap
     this in their own try/except to build a mode-specific failure report.
     """
     tool_llm = make_llm(inspector_tool_config).bind_tools(DEFAULT_REVIEW_TOOLS)
-    structured_llm = make_llm(inspector_config).with_structured_output(
+    reasoner_llm = make_llm(inspector_config)  # thinking ON
+    structured_llm = make_llm(inspector_format_config).with_structured_output(  # thinking OFF
         output_schema, include_raw=True, method="json_schema"
     )
     tool_executor = ToolNode(DEFAULT_REVIEW_TOOLS, handle_tool_errors=False)
+
+    # The inline ToolNode's results never reach the UI server's "messages" stream,
+    # so the loop announces its own tool activity on the custom channel. Guarded:
+    # get_stream_writer() is a no-op outside a streaming run (e.g. tests).
+    try:
+        writer = get_stream_writer()
+    except Exception:
+        writer = None
 
     for _ in range(MAX_TOOL_ITERS):
         try:
@@ -134,15 +169,57 @@ def run_tool_loop(
             if isinstance(m.content, str):
                 m.content = _scrub(m.content)
         messages.extend(tool_result["messages"])
+        stream_tool_calls(writer, ai_msg.tool_calls)
 
     else:
         write(f"❌ Inspector exceeded max tool iterations ({MAX_TOOL_ITERS}).")
 
+    # ── Pass 1: reasoning (thinking ON, free text) ──
+    if reason_prompt is None:
+        reason_prompt = (
+            "You have finished investigating. Think through your verdict and write it "
+            "out as prose — NOT JSON yet. State your conclusion and the concrete "
+            "evidence (files, imports, spec points) behind it, so the next step can "
+            "turn it into a structured verdict without losing detail."
+        )
+    messages.append(HumanMessage(content=reason_prompt))
+    reasoning = reasoner_llm.invoke(messages)
+    stats.record_tokens(reasoning)
+    messages.append(reasoning)  # prose verdict becomes context for the formatter
+
+    # ── Pass 2: formatting (thinking OFF, json_schema) ──
     messages.append(HumanMessage(content=verdict_prompt))
+    parsed = _invoke_structured(structured_llm, messages, fallback_parser)
+
+    # Optional one-shot retry when the formatter returns a degenerate result.
+    if parsed is not None and is_degenerate is not None and is_degenerate(parsed):
+        write("⚠️ Verdict came back incomplete; re-requesting a complete structured verdict.")
+        messages.append(HumanMessage(content=(
+            "Your previous JSON was incomplete or invalid for this verdict. Re-emit the "
+            "structured output, fully populated and consistent with the prose verdict "
+            "you wrote above. Emit ONLY the JSON object — no prose, no markdown."
+        )))
+        retry = _invoke_structured(structured_llm, messages, fallback_parser)
+        if retry is not None and not is_degenerate(retry):
+            parsed = retry
+
+    return parsed
+
+
+def _invoke_structured(structured_llm, messages, fallback_parser=None):
+    """Run the structured-output call and apply an optional fallback parse.
+
+    Returns the parsed object (or None if neither the structured call nor the
+    fallback produced anything usable). Records token usage as a side effect.
+    """
     result = structured_llm.invoke(messages)
     if result.get("raw"):
         stats.record_tokens(result["raw"])
-    return result["parsed"]
+    parsed = result["parsed"]
+    if parsed is None and fallback_parser is not None and result.get("raw"):
+        raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
+        parsed = fallback_parser(raw_text)
+    return parsed
 
 
 def _workspace_listing(project_path: str) -> tuple[set[str], str]:
@@ -187,6 +264,93 @@ def _parse_verifier_fallback(raw_content: str):
             issues=data.get("issues", []),
         )
     return None
+
+
+def _strip_fences(raw_content: str) -> str:
+    """Strip a ```json ... ``` fence if the model wrapped its JSON in one."""
+    cleaned = (raw_content or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned.rsplit("```", 1)[0]
+        cleaned = cleaned.strip()
+    return cleaned
+
+
+def _parse_review_fallback(raw_content: str):
+    """Best-effort parse of a ReviewOutput the structured call didn't return cleanly."""
+    from agents.implementations.code_agent.structured_output import ReviewOutput
+
+    try:
+        data = json.loads(_strip_fences(raw_content))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    verdict = data.get("verdict")
+    if verdict not in ("pass", "fail"):
+        verdict = "fail"  # an unparseable verdict is safest treated as incomplete
+    return ReviewOutput(
+        verdict=verdict,
+        summary=data.get("summary", ""),
+        issues=[_to_issue(i) for i in (data.get("issues") or [])],
+        missing_files=[s for s in (data.get("missing_files") or []) if isinstance(s, str)],
+        new_files=[s for s in (data.get("new_files") or []) if isinstance(s, str)],
+    )
+
+
+def _parse_explore_fallback(raw_content: str):
+    """Best-effort parse of an ExplorerOutput the structured call didn't return cleanly."""
+    from agents.implementations.code_agent.structured_output import ExplorerOutput
+
+    try:
+        data = json.loads(_strip_fences(raw_content))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    summary = data.get("summary", "")
+    if not isinstance(summary, str):
+        return None
+    return ExplorerOutput(
+        summary=summary,
+        files_of_interest=[s for s in (data.get("files_of_interest") or []) if isinstance(s, str)],
+        issues=[s for s in (data.get("issues") or []) if isinstance(s, str)],
+    )
+
+
+# ── Degenerate-output predicates (one per mode) ──────────────────────────────
+# Each returns True when a *parsed* result is structurally valid but contentless
+# — the case that warrants one forceful retry of the structured pass.
+
+def _review_is_degenerate(parsed) -> bool:
+    """A review verdict carrying no signal: empty summary AND no findings at all."""
+    if parsed is None:
+        return True
+    has_findings = bool(parsed.issues or parsed.missing_files or parsed.new_files)
+    return not (parsed.summary or "").strip() and not has_findings
+
+
+def _verifier_is_degenerate(parsed) -> bool:
+    """A verify verdict with an empty summary and (when failing) no issues to act on."""
+    if parsed is None:
+        return True
+    if not (parsed.summary or "").strip():
+        return True
+    if parsed.verdict == "fail" and not parsed.issues:
+        return True  # a 'fail' with nothing concrete to fix is useless to the orchestrator
+    return False
+
+
+def _explore_is_degenerate(parsed) -> bool:
+    """Explore output with no summary and nothing of interest is contentless."""
+    if parsed is None:
+        return True
+    return (
+        not (parsed.summary or "").strip()
+        and not parsed.files_of_interest
+        and not parsed.issues
+    )
 
 
 # ── REVIEW mode helpers ──────────────────────────────────────────────────────

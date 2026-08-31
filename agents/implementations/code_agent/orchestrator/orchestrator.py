@@ -52,6 +52,7 @@ from agents.implementations.code_agent.structured_output import (
 )
 from agents.implementations.code_agent.utils.workspace import restore_snapshot, list_workspace_files
 from agents.implementations.code_agent.utils.validation import extract_paths, on_tree
+from agents.implementations.code_agent.utils.tests_gen import derive_test_targets
 from agents.implementations.code_agent.utils.stats import stats
 
 # Token-limit recovery is keyed on openai's LengthFinishReasonError. The graph
@@ -79,6 +80,10 @@ TASK_RECONSIDERATION_BUDGET = _cfg.get("task_reconsideration_budget", 1)
 # the fresh plan introduced. Default False = scaffold runs exactly once, right
 # after the first plan. The scaffold node clears the request flag when it runs.
 SCAFFOLD_ON_REPLAN = _cfg.get("scaffold_on_replan", False)
+# When True (default), the orchestrator enqueues auto-generated unit-test tasks for
+# untested backend logic modules the first time a plan would complete; the verify
+# gate then runs the suite. See utils/tests_gen.py.
+AUTOGEN_TESTS = _cfg.get("autogenerate_tests", True)
 
 
 def _parse_plan_fallback(raw_content: str) -> PlannerOutput | None:
@@ -104,25 +109,87 @@ def _parse_plan_fallback(raw_content: str) -> PlannerOutput | None:
     )
 
 
-def _sanitize_todo(todo_list: list[SubTask], file_tree: list[str]) -> tuple[list[SubTask], list[tuple[SubTask, list[str]]]]:
+def _make_planner_llms(orch_cfg: dict):
+    """Build the two LLMs for the plan's two-pass split.
+
+    Returns (reasoner_llm, structured_llm):
+      * reasoner_llm  — thinking ON, free text. Does the planning reasoning aloud.
+      * structured_llm — thinking OFF, json_schema. Only converts prose → PlannerOutput.
+
+    Mirrors the architect/inspector split: thinking + constrained json_schema
+    decoding compete for the token budget and the model can close the grammar
+    early, here emitting an empty todo_list — which the node would otherwise read
+    as "objective complete". Splitting the passes prevents that.
     """
-    Drop planner tasks that name ONLY files absent from the canonical tree.
+    reasoner_llm = make_llm(orch_cfg)
+    structured_llm = make_llm({**orch_cfg, "thinking": False}).with_structured_output(
+        PlannerOutput, include_raw=True, method="json_schema"
+    )
+    return reasoner_llm, structured_llm
+
+
+def _invoke_plan(structured_llm, messages) -> PlannerOutput | None:
+    """Run the structured (format) pass and apply the fallback parser.
+
+    Records token usage as a side effect; returns the parsed PlannerOutput or
+    None if both the structured call and the fallback fail.
+    """
+    result = structured_llm.invoke(messages)
+    if result.get("raw"):
+        stats.record_tokens(result["raw"])
+    parsed = result["parsed"]
+    if parsed is None and result.get("raw"):
+        raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
+        parsed = _parse_plan_fallback(raw_text)
+    return parsed
+
+
+# Prose-pass instruction shared by the planner and reconsideration. Kept generic
+# so both reuse it; the format pass that follows carries the schema-specific rules.
+_PLAN_REASON_PROMPT = (
+    "Think through the plan as prose — NOT JSON yet. Reconcile what already exists "
+    "against what the objective and spec still require, decide the ordered tasks "
+    "needed (each one a single-file inspector or architect task), and note which "
+    "files each touches. If — and only if — every requirement is already satisfied "
+    "and present in completed work, say so explicitly. Be concrete; the next step "
+    "turns this into the structured plan."
+)
+
+_PLAN_FORMAT_PROMPT = (
+    "Now convert your reasoning into the structured PlannerOutput JSON: a brief "
+    "thinking_process and the ordered todo_list (each task: agent = 'inspector' or "
+    "'architect', plus a specific instruction). Leave todo_list EMPTY only if you "
+    "stated above that the objective is already fully complete — an empty list means "
+    "'done'. Emit ONLY the JSON object."
+)
+
+
+def _sanitize_todo(todo_list: list[SubTask], file_tree: list[str], workspace_files: list[str] | None = None) -> tuple[list[SubTask], list[tuple[SubTask, list[str]]]]:
+    """
+    Drop planner tasks that name ONLY files absent from the canonical tree AND not
+    already present on disk.
 
     The orchestrator may name files as scope hints, but a task whose every named
     file is off-tree is a hallucination (e.g. 'verify manifest.json for PWA' on a
     project that has no manifest). Letting it through forces the architect into a
     correction loop chasing a file that cannot exist. Tasks that name no files, or
-    name at least one real tree file, pass through unchanged.
+    name at least one real file, pass through unchanged.
+
+    A file that already exists on disk is never a hallucination, so workspace_files
+    counts as valid grounding too — this is what lets the planner act on (e.g.
+    correct or DELETE) a real file that is not in the canonical tree, such as an
+    auto-generated test the verifier flagged.
 
     Returns (kept, dropped) where dropped is a list of (task, off_tree_files).
     """
-    if not file_tree:
+    grounding = list(file_tree or []) + list(workspace_files or [])
+    if not grounding:
         return list(todo_list), []
     kept: list[SubTask] = []
     dropped: list[tuple[SubTask, list[str]]] = []
     for t in todo_list:
         named = extract_paths(t.instruction)
-        off = [f for f in named if not on_tree(f, file_tree)]
+        off = [f for f in named if not on_tree(f, grounding)]
         if named and len(off) == len(named):
             dropped.append((t, off))
         else:
@@ -148,8 +215,7 @@ def _run_reconsideration(
         print("[Orchestrator] orchestrator_reconsideration prompt missing — skipping reconsideration.")
         return None
 
-    llm = make_llm(orch)
-    structured_llm = llm.with_structured_output(PlannerOutput, include_raw=True)
+    reasoner_llm, structured_llm = _make_planner_llms(orch)
     store = state.get("context_store", {})
 
     remaining = "\n".join(
@@ -169,18 +235,17 @@ def _run_reconsideration(
     )
 
     try:
-        result = structured_llm.invoke([HumanMessage(content=full_prompt)])
+        # Pass 1 — reasoning (thinking ON, prose).
+        messages = [HumanMessage(content=full_prompt), HumanMessage(content=_PLAN_REASON_PROMPT)]
+        reasoning = reasoner_llm.invoke(messages)
+        stats.record_tokens(reasoning)
+        messages.append(reasoning)
+        # Pass 2 — formatting (thinking OFF, json_schema).
+        messages.append(HumanMessage(content=_PLAN_FORMAT_PROMPT))
+        planner_out = _invoke_plan(structured_llm, messages)
     except Exception as e:
         print(f"[Orchestrator] Reconsideration LLM call failed: {e}")
         return None
-
-    if result.get("raw"):
-        stats.record_tokens(result["raw"])
-
-    planner_out = result["parsed"]
-    if planner_out is None and result.get("raw"):
-        raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
-        planner_out = _parse_plan_fallback(raw_text)
 
     if planner_out is None or not planner_out.todo_list:
         print("[Orchestrator] Reconsideration produced no tasks — falling through to mechanical retry.")
@@ -472,9 +537,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     else:
         prompt = _cfg["prompts"]["orchestrator"]
 
-    llm = make_llm(orch)
-
-    structured_llm = llm.with_structured_output(PlannerOutput, include_raw=True)
+    reasoner_llm, structured_llm = _make_planner_llms(orch)
     existing_completed = current_plan.completed_tasks if current_plan else []
 
     # Dynamic context for the prompt's $variables. Lists are joined into lines so
@@ -539,9 +602,11 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     messages = [HumanMessage(content=full_prompt)]
 
     try:
-        result = structured_llm.invoke(messages)
+        # Pass 1 — reasoning (thinking ON, prose).
+        messages.append(HumanMessage(content=_PLAN_REASON_PROMPT))
+        reasoning = reasoner_llm.invoke(messages)
     except Exception as e:
-        # Try one more time with stripped-down prompt
+        # Token-limit recovery: retry the reasoning pass with stripped context.
         if isinstance(e, LengthFinishReasonError):
             _w("⚠️ Token limit hit — retrying with minimal context...")
             minimal_prompt = Template(prompt).safe_substitute(
@@ -551,23 +616,18 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
                 latest_report=latest_report[:400],
                 **{k: "" for k in context_vars},
             )
-            minimal_messages = [HumanMessage(content=minimal_prompt)]
-            result = structured_llm.invoke(minimal_messages)  # still raises if this fails too
+            messages = [HumanMessage(content=minimal_prompt), HumanMessage(content=_PLAN_REASON_PROMPT)]
+            reasoning = reasoner_llm.invoke(messages)  # still raises if this fails too
         else:
             _w(f"❌ LLM call failed: `{e}`")
             raise
 
-    if result.get("raw"):
-        # record_tokens both accumulates the run total and pushes this call's usage
-        # onto the custom stream so the UI's live stats meters update mid-run.
-        stats.record_tokens(result["raw"])
+    stats.record_tokens(reasoning)
+    messages.append(reasoning)  # prose plan becomes context for the format pass
 
-    planner_out = result["parsed"]
-
-    if planner_out is None and result["raw"]:
-        raw_text = result["raw"].content if hasattr(result["raw"], "content") else str(result["raw"])
-        _w("⚠️ Schema parse failed — trying fallback parser...")
-        planner_out = _parse_plan_fallback(raw_text)
+    # Pass 2 — formatting (thinking OFF, json_schema).
+    messages.append(HumanMessage(content=_PLAN_FORMAT_PROMPT))
+    planner_out = _invoke_plan(structured_llm, messages)
 
     if planner_out is None:
         _w("⚠️ LLM returned empty response — forcing completion.")
@@ -595,7 +655,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     # giving up — mirrors the architect's single-shot correction pass.
     file_tree = state.get("context_store", {}).get("file_tree", [])
     if file_tree:
-        kept, dropped = _sanitize_todo(planner_out.todo_list, file_tree)
+        kept, dropped = _sanitize_todo(planner_out.todo_list, file_tree, store.get("workspace_files", []))
         for t, off in dropped:
             _w(f"🌲 Dropped off-tree task (`{off}`): {t.instruction[:]}")
         if dropped and not kept:
@@ -622,13 +682,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
                 )),
             ]
             try:
-                fix = structured_llm.invoke(correction)
-                if fix.get("raw"):
-                    stats.record_tokens(fix["raw"])
-                fixed_out = fix["parsed"]
-                if fixed_out is None and fix.get("raw"):
-                    raw_text = fix["raw"].content if hasattr(fix["raw"], "content") else str(fix["raw"])
-                    fixed_out = _parse_plan_fallback(raw_text)
+                fixed_out = _invoke_plan(structured_llm, correction)
                 if fixed_out is not None:
                     kept, _ = _sanitize_todo(fixed_out.todo_list, file_tree)
                     planner_out = fixed_out
@@ -644,6 +698,46 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         if len(kept_tasks) != before:
             _w(f"🚫 Dropped **{before - len(kept_tasks)}** re-planned task(s) matching abandoned instructions.")
         planner_out = PlannerOutput(thinking_process=planner_out.thinking_process, todo_list=kept_tasks)
+
+    # ── Guard against a degenerate empty plan being read as "complete" ────
+    # An empty todo_list later routes to next_agent="complete" and ENDS the run.
+    # A thinking-budget/formatter hiccup can yield an empty list even when work
+    # plainly remains. Distinguish the two: if the list is empty but there is
+    # hard evidence of outstanding work, the empty plan is not trustworthy — ask
+    # the formatter once more, forcefully, and only accept "done" if it agrees.
+    if not planner_out.todo_list:
+        gaps_evidence = [
+            ("review/verification gaps", bool(store.get("verification_gaps"))),
+            ("missing files",            bool(store.get("missing_files"))),
+            ("new files required",       bool(store.get("new_files"))),
+            ("outstanding validation issues", bool(store.get("validation_issues"))),
+            ("a failed last task",       latest_report.startswith("[FAILED]")),
+            ("review reported gaps",     latest_report.startswith("[REVIEW_GAPS]")),
+        ]
+        outstanding = [label for label, present in gaps_evidence if present]
+        if outstanding:
+            _w(f"⚠️ Empty plan but work remains ({', '.join(outstanding)}) — re-requesting a plan.")
+            messages.append(HumanMessage(content=(
+                "You returned an EMPTY todo_list, which ends the run as 'complete'. "
+                "That is wrong: there is still outstanding work — "
+                f"{', '.join(outstanding)}. Re-emit the PlannerOutput JSON with the "
+                "concrete tasks needed to resolve it (each task: agent 'inspector' or "
+                "'architect' plus a specific instruction). Only return an empty "
+                "todo_list if you are certain every requirement is already satisfied. "
+                "Emit ONLY the JSON object."
+            )))
+            retry = _invoke_plan(structured_llm, messages)
+            if retry is not None and retry.todo_list:
+                kept_retry = retry.todo_list
+                if file_tree:
+                    kept_retry, _ = _sanitize_todo(kept_retry, file_tree, store.get("workspace_files", []))
+                if abandoned_tasks:
+                    kept_retry = [t for t in kept_retry if t.instruction not in abandoned_tasks]
+                if kept_retry:
+                    planner_out = PlannerOutput(
+                        thinking_process=retry.thinking_process, todo_list=kept_retry
+                    )
+                    _w(f"✅ Recovered **{len(kept_retry)}** task(s) from the re-request.")
 
     # ── Force-append a review inspector task at the end of every non-empty plan ─
     # This ensures the orchestrator always gets a rich completeness report
@@ -685,6 +779,52 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         instruction_for_agent=instruction_for_agent,
     )
 
+    # ── Autogen tests at the first genuine completion ────────────────────
+    # The very first time a real plan would complete, deterministically enqueue a
+    # test-writing task for every untested backend logic module, then let the
+    # normal architect→coder→validator machinery build them (the Step-2 queue
+    # fast-path drains the rest). Runs exactly once (tests_generated guard); the
+    # final verify gate then runs the suite. Forced completions (iteration cap /
+    # empty LLM) return earlier and never reach here.
+    autogen_ctx: dict = {}
+    if (
+        AUTOGEN_TESTS
+        and new_plan.next_agent == "complete"
+        and not state.get("context_store", {}).get("tests_generated")
+    ):
+        autogen_ctx["tests_generated"] = True
+        targets = derive_test_targets(
+            list_workspace_files(state.get("project_path", ".")),
+            state.get("language"),
+        )
+        if targets:
+            test_tasks = [
+                SubTask(
+                    agent="architect",
+                    instruction=(
+                        f"Write unit tests for {impl} at {test_path}, covering its public "
+                        f"functions and the behaviour the spec requires. Read {impl} first for "
+                        f"the exact API and imports. Use the project's standard test framework "
+                        f"(pytest for .py, jest/vitest for .js/.ts). Test only the public "
+                        f"interface; mock external I/O; keep tests deterministic."
+                    ),
+                )
+                for impl, test_path in targets
+            ]
+            existing_tree = list(state.get("context_store", {}).get("file_tree", []) or [])
+            autogen_ctx["file_tree"] = existing_tree + [
+                tp for _, tp in targets if tp not in existing_tree
+            ]
+            first = test_tasks[0]
+            new_plan = TaskPlan(
+                thinking_process="Autogenerating tests for untested backend logic before completion.",
+                todo_list=test_tasks[1:],
+                completed_tasks=list(new_plan.completed_tasks),
+                next_agent=first.agent,
+                instruction_for_agent=first.instruction,
+            )
+            _w(f"🧪 Autogen tests: enqueuing **{len(test_tasks)}** test task(s) before completion.")
+
     # print a final plan summary (next plan + queue)
     remaining_md = "\n".join(
         f"  {i + 1}. `{task.agent}` — {task.instruction[:100]}"
@@ -701,7 +841,7 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
         "task_failure_counts": failure_counts,
         "abandoned_tasks": abandoned_tasks,
         "task_retry_feedback": "",
-        "active_task_original": instruction_for_agent,
+        "active_task_original": new_plan.instruction_for_agent,
         "task_reconsideration_count": 0,
     }
     if restored_ws is not None:
@@ -714,6 +854,9 @@ def orchestrator_node(state: AgentState, config: RunnableConfig):
     # diverts to scaffold then via its not-yet-scaffolded branch.
     if SCAFFOLD_ON_REPLAN and state.get("context_store", {}).get("scaffolded"):
         return_context["rescaffold_requested"] = True
+    # Fold in the autogen-tests flag (+ extended file_tree) computed above, last so
+    # tests_generated / file_tree take effect on this return.
+    return_context.update(autogen_ctx)
     return {
         "plan": new_plan,
         "iteration_count": 1,

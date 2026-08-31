@@ -34,6 +34,7 @@ from tools import check_imports, run_type_check, run_linter
 from agents.implementations.code_agent.structured_output import AgentState, ValidatorOutput
 from structured_output import LANGUAGES
 from agents.implementations.code_agent.utils.stats import stats
+from agents.implementations.code_agent.utils.stream_helpers import stream_tool_calls
 
 _CFG_PATH = Path(__file__).resolve().parent.parent / "graph_config.yaml"
 with open(_CFG_PATH, "r", encoding="utf-8") as f:
@@ -328,6 +329,9 @@ def validator_node(state: AgentState, config: RunnableConfig) -> dict:
                 tool_name = getattr(m, "name", None) or "tool"
                 tool_evidence.append(f"### {tool_name}\n{m.content}")
             messages.extend(tool_result["messages"])
+            # Announce the tool calls ourselves — the inline ToolNode's results
+            # never reach the UI server's "messages" stream (see stream_helpers).
+            stream_tool_calls(writer, ai_msg.tool_calls)
 
         else:
             _w(f"❌ Validator exceeded max tool iterations ({MAX_TOOL_ITERS}).")

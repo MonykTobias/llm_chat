@@ -23,6 +23,8 @@ from agents.implementations.code_agent.inspector.utils import (
     make_writer,
     run_tool_loop,
     _workspace_listing,
+    _parse_verifier_fallback,
+    _verifier_is_degenerate,
 )
 
 
@@ -57,20 +59,39 @@ def verify(state: AgentState, config: RunnableConfig, project_path: str,
         sandbox_dir=project_path,
     )
 
+    reason_prompt = (
+        "You have finished investigating. Think through your verdict as prose — NOT "
+        "JSON. State pass or fail and the concrete evidence: which required features "
+        "and canonical files are present or missing, and which spec/objective points "
+        "are unmet. Be specific with paths so the next step can produce a structured "
+        "verdict without losing detail."
+    )
+
     verdict_prompt = (
-        "You have finished your investigation. "
-        "Based on the tool results above, produce a verification verdict. "
-        "Set verdict to 'pass' only if the project fully satisfies the objective "
-        "and all canonical files exist. Otherwise set 'fail' and list the issues."
+        "Now convert your verdict into the structured ValidatorOutput JSON. Set verdict "
+        "to 'pass' only if the project fully satisfies the objective and all canonical "
+        "files exist. Otherwise set 'fail' and list each gap as an issue with its "
+        "file_path. Emit ONLY the JSON object."
     )
 
     messages: list[BaseMessage] = [HumanMessage(content=system_prompt)]
     work: dict = dict(state)
     parsed = None  # default to None if loop crashes
 
+    # A 'fail' with no LLM issues is normally degenerate (nothing to act on), but
+    # it is fully grounded when the Python pre-check already found missing files —
+    # those gaps come from computed_missing, not the issues list. Don't retry then.
+    def _verify_degenerate(p) -> bool:
+        if computed_missing and p is not None and p.verdict == "fail":
+            return not (p.summary or "").strip()
+        return _verifier_is_degenerate(p)
+
     try:
         parsed = run_tool_loop(
-            messages, work, config, ValidatorOutput, verdict_prompt, _w
+            messages, work, config, ValidatorOutput, verdict_prompt, _w,
+            reason_prompt=reason_prompt,
+            fallback_parser=_parse_verifier_fallback,
+            is_degenerate=_verify_degenerate,
         )
     except Exception as e:
         _w(f"❌ Verifier crashed: `{e}`")

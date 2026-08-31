@@ -20,6 +20,8 @@ from agents.implementations.code_agent.inspector.utils import (
     _cfg,
     make_writer,
     run_tool_loop,
+    _parse_explore_fallback,
+    _explore_is_degenerate,
 )
 
 
@@ -42,15 +44,24 @@ def explore(state: AgentState, config: RunnableConfig, project_path: str,
 
     messages: list[BaseMessage] = [HumanMessage(content=system_prompt)]
     work: dict = dict(state)
+    reason_prompt = (
+        "You have finished exploring. Summarise what you found as prose — NOT JSON. "
+        "Note the files worth the architect's attention and anything broken, missing, "
+        "or suspicious, with specific paths."
+    )
     verdict_prompt = (
-        "Summarise your findings concisely in 2-3 sentences. "
-        "List any specific files or issues discovered."
+        "Now convert your findings into the structured ExplorerOutput JSON: a concise "
+        "2-3 sentence summary, the specific files of interest, and any issues "
+        "discovered. Emit ONLY the JSON object."
     )
     parsed = None
 
     try:
         parsed = run_tool_loop(
-            messages, work, config, ExplorerOutput, verdict_prompt, _w
+            messages, work, config, ExplorerOutput, verdict_prompt, _w,
+            reason_prompt=reason_prompt,
+            fallback_parser=_parse_explore_fallback,
+            is_degenerate=_explore_is_degenerate,
         )
     except Exception as e:
         msg = f"[FAILED] Inspector crashed: {e}"
@@ -59,14 +70,27 @@ def explore(state: AgentState, config: RunnableConfig, project_path: str,
 
     LANGUAGE = work["language"]
 
+    if parsed is None:
+        _w("⚠️ Inspector produced no parseable findings.")
+        return {
+            "latest_report": "Inspector produced no parseable findings.",
+            "context_store": {
+                "inspector_raw": "",
+                "inspector_files": [],
+                "inspector_issues": [],
+            },
+            "history": ["inspector"],
+            "language": LANGUAGE,
+        }
+
     _w(f"✅ **Findings:** {parsed.summary}")
 
     return {
         "latest_report": parsed.summary,
         "context_store": {
             "inspector_raw": parsed.summary,
-            "inspector_files": parsed.files_of_interest if parsed else [],
-            "inspector_issues": parsed.issues if parsed else [],
+            "inspector_files": parsed.files_of_interest,
+            "inspector_issues": parsed.issues,
         },
         "history": ["inspector"],
         "language": LANGUAGE,

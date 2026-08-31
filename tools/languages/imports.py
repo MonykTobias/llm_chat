@@ -88,17 +88,26 @@ def format_report(language: str,
                   unused: "list[tuple]",
                   cycles: "list[list[str]]",
                   notes: "list[str] | tuple[str, ...]" = (),
-                  *, circular_note: "str | None" = None) -> str:
+                  *, circular_note: "str | None" = None,
+                  unresolved_ext: "list[tuple] | tuple" = ()) -> str:
     """Render the canonical sectioned import-check report, bounded by `_truncate`.
 
     `circular_note` replaces the "none found" line in the CIRCULAR section when no
     cycles were detected — used by languages where cycles either can't occur or
     aren't analyzed (e.g. Rust), so a clean "0" is not mistaken for "checked".
+
+    `unresolved_ext` holds unresolved *third-party* imports — same
+    `(relpath, line, display, reason)` shape as `broken`, but rendered as a
+    NON-failing advisory: an uninstalled external package in the check environment
+    is usually an undeclared/uninstalled dependency, not a code defect, and a false
+    "broken import" is more harmful to a review than a missed one. The section is
+    omitted entirely when empty, so languages that don't supply it are unaffected.
     """
     # Tools can report the same finding more than once (e.g. cargo --all-targets
     # re-checks a crate per target); dedupe so the report counts each once.
     broken = sorted(set(broken))
     unused = sorted(set(unused))
+    unresolved_ext = sorted(set(unresolved_ext))
     cycles = _dedupe_cycles(cycles)
 
     out = [f"== IMPORT CHECK ({language}) =="]
@@ -109,6 +118,14 @@ def format_report(language: str,
             out.append(f"  {relp}:{ln}  {disp}  -> {reason}")
     else:
         out.append("\nBROKEN / UNRESOLVABLE (0): none found.")
+
+    if unresolved_ext:
+        out.append(f"\nUNRESOLVED THIRD-PARTY ({len(unresolved_ext)}) — NOT a failure: "
+                   "these external packages aren't installed in the check "
+                   "environment (likely an undeclared/uninstalled dependency, not a "
+                   "code defect). Verify the name only if it looks misspelled.")
+        for relp, ln, disp, reason in unresolved_ext:
+            out.append(f"  {relp}:{ln}  {disp}  -> {reason}")
 
     if unused:
         out.append(f"\nUNUSED ({len(unused)}):")
@@ -130,5 +147,8 @@ def format_report(language: str,
         out.append(f"\n{note}")
 
     out.append(f"\nSummary: {len(broken)} broken, {len(unused)} unused, "
-               f"{len(cycles)} circular.")
+               f"{len(cycles)} circular"
+               + (f", {len(unresolved_ext)} unresolved third-party (advisory)"
+                  if unresolved_ext else "")
+               + ".")
     return _truncate("\n".join(out))
