@@ -3,10 +3,11 @@
 A local-first coding assistant with a browser UI for reviewing, explaining, planning, implementing, and validating code. It uses LangChain/LangGraph for agent workflows and Ollama for local models.
 
 ## Screenshots
-### Chat
-![screenshot_chat.png](assets/screenshot_chat.png)
+
 ### Code Review
 ![screenshot_code_review.png](assets/screenshot_code_review.png)
+### Chat
+![screenshot_chat.png](assets/screenshot_chat.png)
 
 ## Features
 
