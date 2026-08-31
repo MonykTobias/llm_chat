@@ -46,6 +46,15 @@ agents:
     max_tokens: 32768
     thinking: true
 
+  qwen3.5:9b:
+    model: "qwen3.5:9b"
+    base_url: "http://localhost:11434/v1"
+    api_key: "ollama"
+    temperature: 0.0
+    context_window: 262144
+    max_tokens: 32768
+    thinking: true
+
   gpt-oss:20b-low:
     model: "gpt-oss:20b"
     base_url: "http://localhost:11434/v1"
